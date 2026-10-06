@@ -1,8 +1,25 @@
 use crate::models::CallStackNode;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// Converts the aggregated call tree into standard profiling formats (e.g., collapsed stack).
 pub struct OutputFormatter;
+
+/// Which side of a differential flamegraph a single call stack falls on.
+///
+/// `flamegraph.pl --diff` shades each frame by the ratio between a baseline and a current
+/// count: regressions red, improvements blue. Rendering SVG is an explicit MVP cut
+/// (`AGENTS.md` forbids adding `inferno` or any SVG library), so this type is where the
+/// red/blue *decision* lives and gets tested, and the external viewer applies the hue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScale {
+    /// The stack costs more in the current run — the renderer draws it red.
+    Regression,
+    /// The stack costs less in the current run — the renderer draws it blue.
+    Improvement,
+    /// Identical cost in both runs, including a stack that costs nothing.
+    Neutral,
+}
 
 impl OutputFormatter {
     /// Formats the tree into a collapsed stack efficiently.
@@ -31,6 +48,85 @@ impl OutputFormatter {
 
         // Backtrack efficiently by truncating to the original length
         current_path.truncate(original_len);
+    }
+
+    /// Read a folded-stack artifact (`<stack> <count>` per line) into stack -> cost.
+    ///
+    /// [`to_collapsed_stack`](Self::to_collapsed_stack) writes this format, but the input
+    /// here comes off disk and may be truncated or hand-edited, so a malformed line is
+    /// reported with its line number instead of being skipped. Repeated stacks are summed,
+    /// which is what the consuming viewers do when they merge duplicate lines.
+    pub fn parse_folded(input: &str) -> Result<BTreeMap<String, u64>, String> {
+        let mut stacks: BTreeMap<String, u64> = BTreeMap::new();
+
+        for (index, line) in input.lines().enumerate() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+
+            let (path, cost) = line.rsplit_once(' ').ok_or_else(|| {
+                format!(
+                    "line {}: expected `<stack> <count>`, got {line:?}",
+                    index + 1
+                )
+            })?;
+            let cost = cost.parse::<u64>().map_err(|_| {
+                format!(
+                    "line {}: expected a non-negative integer cost, got {cost:?}",
+                    index + 1
+                )
+            })?;
+
+            let total = stacks.entry(path.to_string()).or_insert(0);
+            *total = total.saturating_add(cost);
+        }
+
+        Ok(stacks)
+    }
+
+    /// Pair two folded-stack artifacts into the diff format `flamegraph.pl --diff` reads:
+    /// `<stack> <baseline> <current>`.
+    ///
+    /// A stack present in only one run gets `0` on the missing side, so a frame that was
+    /// added or removed shows up downstream as an unbounded red or blue frame rather than
+    /// silently vanishing from the comparison. Keys are taken from the sorted maps, making
+    /// the output byte-stable across runs — which is the whole point of the artifact, since
+    /// a cost regression is only trustworthy if re-running the diff produces no noise.
+    pub fn to_differential_folded(baseline: &str, current: &str) -> Result<String, String> {
+        let baseline = Self::parse_folded(baseline)?;
+        let current = Self::parse_folded(current)?;
+
+        let paths: BTreeSet<&str> = baseline
+            .keys()
+            .map(String::as_str)
+            .chain(current.keys().map(String::as_str))
+            .collect();
+
+        let mut output = String::with_capacity(1024);
+        for path in paths {
+            let base = baseline.get(path).copied().unwrap_or(0);
+            let now = current.get(path).copied().unwrap_or(0);
+            let _ = writeln!(output, "{path} {base} {now}");
+        }
+
+        Ok(output)
+    }
+
+    /// Classify one stack's baseline/current pair for the [`DeltaScale`] color mapping.
+    ///
+    /// Comparison is on the raw counts rather than a ratio: a stack added since the
+    /// baseline has ratio `inf` and a removed one has `0/0`, both of which the sign rule
+    /// already classifies correctly. Intensity is left to the renderer, which is the only
+    /// component that knows a picture's dynamic range.
+    pub fn delta_scale(baseline: u64, current: u64) -> DeltaScale {
+        if current > baseline {
+            DeltaScale::Regression
+        } else if current < baseline {
+            DeltaScale::Improvement
+        } else {
+            DeltaScale::Neutral
+        }
     }
 }
 
@@ -157,5 +253,112 @@ mod tests {
 
         assert!(output.ends_with('\n'));
         assert!(!output.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn parse_folded_sums_repeated_stacks_and_skips_blank_lines() {
+        // A real artifact emits the same stack once per traversal, so counts must add up
+        // rather than overwrite.
+        let parsed = OutputFormatter::parse_folded("main 10\n\nmain 15\nmain;leaf 3\n").unwrap();
+
+        assert_eq!(parsed.get("main"), Some(&25));
+        assert_eq!(parsed.get("main;leaf"), Some(&3));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_folded_names_the_offending_line() {
+        // Input comes from disk and may be truncated or hand-edited, so it is untrusted:
+        // a bad line must produce an error naming its position, never a panic.
+        let missing_cost = OutputFormatter::parse_folded("main 1\nmain\n").unwrap_err();
+        assert!(missing_cost.contains("line 2"), "got: {missing_cost}");
+
+        let negative_cost = OutputFormatter::parse_folded("main 1\nmain;-5\n").unwrap_err();
+        assert!(negative_cost.contains("line 2"), "got: {negative_cost}");
+    }
+
+    #[test]
+    fn identical_runs_diff_to_equal_counts() {
+        let trace = "main 10\nmain;leaf 3\n";
+
+        let output =
+            OutputFormatter::to_differential_folded(trace, trace).expect("well-formed input");
+
+        assert_eq!(output, "main 10 10\nmain;leaf 3 3\n");
+        for line in output.lines() {
+            let cost = line.split(' ').nth(1).unwrap().parse().unwrap();
+            assert_eq!(
+                OutputFormatter::delta_scale(cost, cost),
+                DeltaScale::Neutral
+            );
+        }
+    }
+
+    #[test]
+    fn stacks_missing_from_one_side_get_a_zero() {
+        // Dropping a one-sided stack would hide exactly the two cases a regression hunt
+        // cares about: a frame that appeared and a frame that disappeared.
+        let output =
+            OutputFormatter::to_differential_folded("main;gone 7\n", "main;new 4\n").unwrap();
+
+        assert_eq!(output, "main;gone 7 0\nmain;new 0 4\n");
+    }
+
+    #[test]
+    fn differential_output_is_sorted_by_stack() {
+        // Byte-stability is load-bearing: if the diff changed only in line order, a real
+        // comparison against a stored artifact would report noise as a regression.
+        let baseline = "z 1\na 2\nm 3\n";
+        let current = "z 9\na 9\nm 9\n";
+
+        let output = OutputFormatter::to_differential_folded(baseline, current).unwrap();
+        let paths: Vec<&str> = output
+            .lines()
+            .map(|line| line.split(' ').next().unwrap())
+            .collect();
+
+        assert_eq!(paths, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn delta_scale_classifies_by_sign_of_the_difference() {
+        assert_eq!(OutputFormatter::delta_scale(10, 11), DeltaScale::Regression);
+        assert_eq!(OutputFormatter::delta_scale(10, 9), DeltaScale::Improvement);
+        assert_eq!(OutputFormatter::delta_scale(10, 10), DeltaScale::Neutral);
+
+        // Added and removed frames fall out of the same rule: 0 -> cost is a regression,
+        // cost -> 0 is an improvement.
+        assert_eq!(OutputFormatter::delta_scale(0, 5), DeltaScale::Regression);
+        assert_eq!(OutputFormatter::delta_scale(5, 0), DeltaScale::Improvement);
+        assert_eq!(OutputFormatter::delta_scale(0, 0), DeltaScale::Neutral);
+    }
+
+    #[test]
+    fn the_differ_consumes_the_formatters_own_output() {
+        // The two halves of the feature must compose: stage 4 writes collapsed stacks, and
+        // the differ reads them back without a format translation step.
+        let baseline = OutputFormatter::to_collapsed_stack(&node(
+            "main",
+            10,
+            vec![leaf("compute_heavy_loop", 400)],
+        ));
+        let current = OutputFormatter::to_collapsed_stack(&node(
+            "main",
+            10,
+            vec![leaf("compute_heavy_loop", 900)],
+        ));
+
+        let output = OutputFormatter::to_differential_folded(&baseline, &current).unwrap();
+        let regression = output
+            .lines()
+            .find(|line| line.starts_with("main;compute_heavy_loop"))
+            .expect("the child stack should survive the diff");
+
+        assert_eq!(regression, "main;compute_heavy_loop 400 900");
+        assert_eq!(
+            OutputFormatter::delta_scale(400, 900),
+            DeltaScale::Regression,
+            "a 500-unit cost increase should read red"
+        );
     }
 }
