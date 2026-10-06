@@ -48,11 +48,16 @@ mod tests {
     }
 
     #[test]
-    fn test_tracer_initialization() {
+    fn test_tracer_trace_and_flush() {
         let mut tracer = ExecutionTracer::new();
-        assert!(!tracer.is_initialized);
+        assert!(tracer.trace().is_empty());
+
+        tracer.record_call(1, 10, 5);
         let events = tracer.trace();
-        assert!(tracer.is_initialized);
-        assert!(events.is_empty()); // Currently returns empty vec
+        assert_eq!(events, tracer.events);
+        assert_eq!(events.len(), 1, "trace() must not drain the buffer");
+
+        assert_eq!(tracer.flush_trace().len(), 1);
+        assert!(tracer.trace().is_empty());
     }
 }
