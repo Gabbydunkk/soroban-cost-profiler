@@ -15,4 +15,15 @@ edition = "2024"
 
 [dependencies]
 soroban-env-host = "28.0.2"
+tracing = "0.1.44"
 wasmi = "2.0.0"
+
+[profile.release]
+opt-level = "z"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "tracer_benchmark"
+harness = false

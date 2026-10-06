@@ -13,6 +13,7 @@ This repository (`soroban-cost-profiler`) is **Tier 3** of the Tollcraft cost-aw
 3. **Avoid Dependency Bloat:** Do NOT add `inferno` or any SVG rendering libraries for the MVP. We are only outputting `.folded` stack text files to be consumed by external tools like `speedscope.app`.
 4. **No Custom DWARF Parsing:** Do NOT write custom `gimli` parsers if you can avoid it. Rely on `addr2line` for source mapping.
 5. **OOM Safety:** Smart contracts can run up to 100M instructions. You can buffer these in a flat `Vec` in memory for the MVP, but do not allocate massive heap objects per instruction.
+6. **Descriptive PRs:** Whenever you create a Pull Request, the PR body MUST be highly descriptive and contain a detailed breakdown of the changes made, rather than a generic summary like "Closes #X".
 
 ## 🛠️ Common Commands
 * **Build:** `cargo build`

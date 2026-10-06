@@ -15,9 +15,23 @@
 - [x] **SPIKE:** Investigate `soroban-env-host` Budget API limitations.
 - [x] **WASM Engine Setup:** Import `soroban-env-host` and `wasmi` as dependencies.
 - [x] **Fixture Compilation:** Add a `fixtures/dummy-contract` Soroban contract with a `compute_heavy_loop` function and workspace integration.
-- [ ] **Tracer Hooks:** Implement the `wasmi` execution hooks in `src/tracer.rs` to intercept instructions.
-- [ ] **Instruction Counting:** Accurately measure and record CPU cost and `pc` at every step.
-- [ ] **Call/Return Tracking:** Record entry and exit events for WASM function calls.
+- [x] **Fixture Documentation:** Add README and doc comments to dummy-contract fixture.
+- [x] **Fixture Script:** Add `fixtures/build.sh` compile script.
+- [x] **Memory Fixture:** Add `memory_heavy_loop` to dummy contract.
+- [x] **Tracer State:** Scaffold `ExecutionTracer` state and `TraceEvent` structures.
+- [x] **Instruction Metering:** Enable fuel consumption in the `wasmi` engine setup.
+- [x] **WASM Parser:** Implement a WASM file loader and `wasmi` module parser.
+- [x] **Host Setup:** Scaffold the native `soroban_env_host::Host` proxy for the tracer.
+- [x] **Trace Data Models:** Write detailed doc comments for `TraceEvent` structures.
+- [x] **Architecture Docs:** Create the internal `tracer_architecture.md` document explaining the sampling mechanics.
+- [x] **Mock Host:** Scaffold `MockHost` struct for the environment.
+- [x] **Module Instantiation:** Implement `instantiate_module` and link imports.
+- [x] **Function Invocation:** Implement `invoke_function` for named exports.
+- [x] **Memory Cost:** Track `mem_cost` alongside `cpu_cost`.
+- [x] **Host Boundaries:** Distinguish host call boundaries from WASM boundaries.
+- [x] **Tracer Hooks:** Implement the `wasmi` execution hooks in `src/tracer.rs` to intercept instructions.
+- [x] **Instruction Counting:** Accurately measure and record CPU cost and `pc` at every step.
+- [x] **Call/Return Tracking:** Record entry and exit events for WASM function calls.
 
 ## Phase 3: DWARF Source Mapping
 - [ ] **Add Dependencies:** Add `addr2line` and `gimli` for debug info parsing.

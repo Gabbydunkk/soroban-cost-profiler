@@ -31,3 +31,26 @@ jobs:
 
     - name: Run Tests
       run: cargo test --workspace
+
+  build-fixture:
+    name: Build Fixture
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+        
+    - name: Build WASM Fixture
+      run: |
+        cd fixtures
+        ./build.sh
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dummy-contract-wasm
+        path: target/wasm32-unknown-unknown/release/dummy_contract.wasm
