@@ -56,10 +56,10 @@ impl ExecutionTracer {
         self
     }
 
-    /// Set the maximum number of steps accepted before [`record_step`] starts failing.
+    /// Set the maximum number of steps accepted before
+    /// [`record_step`](crate::tracer::ExecutionTracer::record_step) starts failing.
     ///
     /// This is the protection against an infinite loop inside the profiled contract.
-    /// [`record_step`]: ExecutionTracer::record_step
     pub fn with_instruction_ceiling(mut self, ceiling: u64) -> Self {
         self.instruction_ceiling = ceiling;
         self
@@ -288,20 +288,32 @@ pub fn instantiate_module(
 
 /// Run an exported function while recording the boundaries it crosses.
 ///
-/// A call hook is installed on the store before the call, so every WASM/host entry and
-/// exit is turned into a tracer event as execution proceeds. Results are written into
-/// `results`, which the caller must size to the function's return arity.
+/// A call hook is installed on the store before the call, and `wasmi` runs it at the
+/// boundaries it actually sees: one `CallingWasm`/`ReturningFromWasm` pair for the call this
+/// function starts, plus a `CallingHost`/`ReturningFromHost` pair for every host function the
+/// contract invokes. Results are written into `results`, which the caller must size to the
+/// function's return arity.
 ///
-/// Two known limitations, both traceable to what `wasmi` 2.0 exposes to a call hook:
+/// Three consequences, all traceable to what `wasmi` 2.0 exposes to a call hook:
 ///
-/// * Every event is recorded at `pc = 0`. Real program counters are not available in
-///   the hook, so cost currently lands on function boundaries only and cannot be
-///   attributed to a source line until DWARF mapping arrives (Phase 3).
-/// * One synthetic step of cost 1 is recorded per boundary rather than per
-///   instruction, because there is no instruction-level hook. CPU cost therefore
-///   under-reports work done inside a function body; the host-budget deltas in
-///   [`record_host_return`] are the accurate part.
+/// * **WASM-to-WASM calls are invisible.** The engine fires the WASM half of the hook only
+///   where a host-initiated call enters it, not for calls made from inside running wasm. A
+///   contract that calls five helpers still produces exactly one `Call` and one `Return`
+///   event, so the trace names the entry point but not the call tree beneath it — which is
+///   why [`ProfileAggregator::aggregate`] cannot be written against these events alone.
+///   `only_the_outer_invocation_is_recorded_as_a_boundary` in `tests/meter_probe.rs` pins
+///   this, and says what to change rather than delete when a per-call hook exists.
+/// * Every event is recorded at `pc = 0`. A call hook is given no program counter, so the
+///   cost of a whole call lands on its single boundary and cannot be attributed to a source
+///   line until the engine hands the tracer an offset — see [`SourceMapper`] for what real
+///   PCs would unlock, and why DWARF alone is not enough.
+/// * One synthetic step of cost 1 is recorded per boundary rather than per instruction,
+///   because there is no instruction-level hook. CPU cost therefore under-reports work done
+///   inside a function body; the host-budget deltas in [`record_host_return`] are the
+///   accurate part.
 ///
+/// [`ProfileAggregator::aggregate`]: crate::aggregator::ProfileAggregator::aggregate
+/// [`SourceMapper`]: crate::source_map::SourceMapper
 /// [`record_host_return`]: ExecutionTracer::record_host_return
 #[tracing::instrument(skip(store, instance, params, results))]
 pub fn invoke_function(
@@ -313,7 +325,8 @@ pub fn invoke_function(
 ) -> Result<(), wasmi::Error> {
     info!("Invoking function: {}", func_name);
 
-    // Intercept call boundaries so the tracer sees the shape of the execution.
+    // Record the boundaries the engine reports: this call's entry and exit, plus each host
+    // call in between. Calls the contract makes to its own functions do not reach here.
     store.call_hook(|state: &mut ProfilerState, hook_type| {
         // Remaining fuel is not reachable from inside this callback, so boundaries are
         // recorded as events and costed from the host budget instead of from fuel.
