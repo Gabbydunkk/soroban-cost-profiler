@@ -64,3 +64,9 @@
 - [x] **Polish:** Add inline SVG favicon, `color-scheme` for native scrollbars, remove dead CSS (`.term__flame-block`, `.card`), clean duplicate rule, swap visible em-dashes for commas/parens.
 - [x] **Social sharing:** Add branded 1200x630 Open Graph image (`docs/og-image.png`) plus `og:image`/`twitter:card` (summary_large_image) meta tags with alt text.
 - [x] **Favicon:** Replace the inline SVG favicon with the Tollcraft org profile picture (`docs/favicon.png`, downloaded from GitHub avatars and converted to PNG), plus an `apple-touch-icon` link.
+
+## Phase 6: Code Quality & Refactoring ✅
+- [x] Refactor and modularize complex logic in `src/tracer.rs` (#64)
+- [x] Review and optimize performance/allocations in `src/formatter.rs` (#63)
+- [x] Improve inline documentation and comments in `src/aggregator.rs` (#62)
+- [x] Add comprehensive unit tests for `src/lib.rs` (#61)

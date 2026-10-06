@@ -119,6 +119,7 @@ impl ExecutionTracer {
         std::mem::take(&mut self.events)
     }
 
+    /// Traces the execution by initializing the engine, setting up hooks, and running.
     pub fn trace(&mut self) -> Vec<TraceEvent> {
         self.events.clone()
     }
