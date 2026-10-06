@@ -19,3 +19,10 @@ wasmi = "2.0.0"
 
 [profile.release]
 opt-level = "z"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "tracer_benchmark"
+harness = false
