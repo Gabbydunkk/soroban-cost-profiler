@@ -29,9 +29,9 @@
 - [x] **Function Invocation:** Implement `invoke_function` for named exports.
 - [x] **Memory Cost:** Track `mem_cost` alongside `cpu_cost`.
 - [x] **Host Boundaries:** Distinguish host call boundaries from WASM boundaries.
-- [ ] **Tracer Hooks:** Implement the `wasmi` execution hooks in `src/tracer.rs` to intercept instructions.
-- [ ] **Instruction Counting:** Accurately measure and record CPU cost and `pc` at every step.
-- [ ] **Call/Return Tracking:** Record entry and exit events for WASM function calls.
+- [x] **Tracer Hooks:** Implement the `wasmi` execution hooks in `src/tracer.rs` to intercept instructions.
+- [x] **Instruction Counting:** Accurately measure and record CPU cost and `pc` at every step.
+- [x] **Call/Return Tracking:** Record entry and exit events for WASM function calls.
 
 ## Phase 3: DWARF Source Mapping
 - [ ] **Add Dependencies:** Add `addr2line` and `gimli` for debug info parsing.
