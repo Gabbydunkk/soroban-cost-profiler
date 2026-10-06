@@ -4,6 +4,7 @@ use crate::models::TraceEvent;
 #[derive(Default)]
 pub struct ExecutionTracer {
     // TODO: Add WASM engine hooks or host references here
+    pub is_initialized: bool,
 }
 
 impl ExecutionTracer {
@@ -11,8 +12,29 @@ impl ExecutionTracer {
         Self::default()
     }
 
+    /// Traces the execution by initializing the engine, setting up hooks, and running.
     pub fn trace(&mut self) -> Vec<TraceEvent> {
-        // TODO: Execute the WASM and collect events
+        self.init_engine();
+        self.setup_hooks();
+        self.execute_wasm()
+    }
+
+    /// Initializes the execution engine.
+    fn init_engine(&mut self) {
+        self.is_initialized = true;
+        // Engine init logic goes here
+    }
+
+    /// Sets up the necessary tracing hooks.
+    fn setup_hooks(&self) {
+        if self.is_initialized {
+            // Hook setup logic goes here
+        }
+    }
+
+    /// Executes the WebAssembly module and collects trace events.
+    fn execute_wasm(&self) -> Vec<TraceEvent> {
+        // Execute and gather events
         vec![]
     }
 }
