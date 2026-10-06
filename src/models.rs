@@ -1,5 +1,10 @@
 use std::collections::HashMap;
 
+/// Represents the kind of WASM execution event intercepted by the tracer.
+///
+/// * `Call`: Indicates that execution has crossed a function boundary into a new frame.
+/// * `Return`: Indicates that the current function frame has exited.
+/// * `Step`: Indicates that a WASM instruction (or sequence of instructions) was executed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventType {
     Call,
@@ -7,11 +12,16 @@ pub enum EventType {
     Step,
 }
 
+/// A snapshot of execution state emitted by the `ExecutionTracer`.
+///
+/// This model captures the program counter and associated costs for a specific `EventType`.
+/// `cpu_cost` and `mem_cost` represent the delta (accumulated cost) since the last event
+/// was emitted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceEvent {
     pub pc: usize, // WASM Program Counter (Instruction Pointer)
     pub event_type: EventType,
-    pub cpu_cost: u64, // CPU instructions consumed since last event
+    pub cpu_cost: u64, // CPU cost consumed since last event
     pub mem_cost: u64, // Memory allocated since last event
 }
 

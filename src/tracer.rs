@@ -74,8 +74,20 @@ pub fn load_wasm_file(path: &str) -> std::io::Result<Vec<u8>> {
 }
 
 pub fn setup_engine() -> wasmi::Engine {
-    let config = wasmi::Config::default();
+    let mut config = wasmi::Config::default();
+    config.consume_fuel(true);
     wasmi::Engine::new(&config)
+}
+
+pub fn parse_module(
+    engine: &wasmi::Engine,
+    wasm_bytes: &[u8],
+) -> Result<wasmi::Module, wasmi::Error> {
+    wasmi::Module::new(engine, wasm_bytes)
+}
+
+pub fn create_host() -> soroban_env_host::Host {
+    soroban_env_host::Host::default()
 }
 
 #[cfg(test)]
