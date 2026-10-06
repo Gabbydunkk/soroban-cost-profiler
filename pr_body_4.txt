@@ -1,0 +1,24 @@
+This PR resolves the next 5 foundational tasks for Phase 2: Execution Tracing, completing WASM initialization, host instantiation, and tracking memory and host invocation boundaries.
+
+### 🚀 Changes
+
+1. **Mock Host Environment**
+   - Created a basic `MockHost` struct in `src/tracer.rs` utilizing `#[derive(Default)]` to serve as a mock backend for our proxy execution environment, matching issue requirements to scaffold the mock state. (Closes #21)
+
+2. **Module Instantiation**
+   - Implemented the `instantiate_module` method wrapping the `wasmi::Linker`.
+   - Used `linker.instantiate_and_start` (using the modern `wasmi` 2.0.0 API) to instantiate the compiled `wasmi::Module` in the `wasmi::Store`. (Closes #22)
+
+3. **Function Invocation Engine**
+   - Wrote `invoke_function` in `src/tracer.rs` which safely looks up a named export from a given `wasmi::Instance` and calls it using the runtime store, taking arbitrary `wasmi::Val` parameters and returning into a result buffer. (Closes #23)
+
+4. **Memory Tracking in State**
+   - Updated the `ExecutionTracer` state model to include a `current_mem_cost` accumulator natively incremented during execution via `record_step`.
+   - The event stream (`TraceEvent`) now properly consumes and stores `mem_cost` natively on steps, function calls, and returns. (Closes #24)
+
+5. **Host Function Boundaries**
+   - Augmented `EventType` within `src/models.rs` with `HostCall` and `HostReturn` enum variants to distinguish regular in-WASM frame transitions from expensive environment trampoline calls.
+   - Provided `record_host_call` and `record_host_return` hooks to bypass sampling and record direct host boundaries precisely. (Closes #25)
+
+6. **Roadmap Updates**
+   - Updated `ROADMAP.md` to check off the newly implemented milestones.

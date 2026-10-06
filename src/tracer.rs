@@ -17,7 +17,8 @@ pub struct ExecutionTracer {
     pub current_step_cost: u64,
     pub current_mem_cost: u64,
     pub sample_rate: u64,
-    // TODO: Add WASM engine hooks or host references here
+    pub instruction_count: u64,
+    pub instruction_ceiling: u64,
 }
 
 impl Default for ExecutionTracer {
@@ -27,6 +28,8 @@ impl Default for ExecutionTracer {
             current_step_cost: 0,
             current_mem_cost: 0,
             sample_rate: 100, // Default sample rate
+            instruction_count: 0,
+            instruction_ceiling: 100_000_000,
         }
     }
 }
@@ -38,6 +41,11 @@ impl ExecutionTracer {
 
     pub fn with_sample_rate(mut self, sample_rate: u64) -> Self {
         self.sample_rate = sample_rate;
+        self
+    }
+    
+    pub fn with_instruction_ceiling(mut self, ceiling: u64) -> Self {
+        self.instruction_ceiling = ceiling;
         self
     }
 
@@ -54,6 +62,7 @@ impl ExecutionTracer {
             self.current_step_cost = 0;
             self.current_mem_cost = 0;
         }
+        Ok(())
     }
 
     pub fn record_call(&mut self, pc: usize, cpu_cost: u64, mem_cost: u64) {
@@ -111,10 +120,7 @@ pub fn setup_engine() -> wasmi::Engine {
     wasmi::Engine::new(&config)
 }
 
-pub fn parse_module(
-    engine: &wasmi::Engine,
-    wasm_bytes: &[u8],
-) -> Result<wasmi::Module, wasmi::Error> {
+pub fn parse_module(engine: &wasmi::Engine, wasm_bytes: &[u8]) -> Result<wasmi::Module, wasmi::Error> {
     wasmi::Module::new(engine, wasm_bytes)
 }
 
