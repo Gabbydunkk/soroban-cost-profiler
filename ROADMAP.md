@@ -70,3 +70,20 @@
 - [x] Review and optimize performance/allocations in `src/formatter.rs` (#63)
 - [x] Improve inline documentation and comments in `src/aggregator.rs` (#62)
 - [x] Add comprehensive unit tests for `src/lib.rs` (#61)
+- [x] Add comprehensive unit tests for `src/formatter.rs` (#53)
+- [x] Improve inline documentation and comments in `src/tracer.rs` (#54)
+- [x] Add comprehensive unit tests for `fixtures/dummy-contract/src/lib.rs` (#57)
+- [x] Improve inline documentation and comments in `src/main.rs` (#58)
+
+### Blocked on unimplemented code
+The quality-issue bank (#45-#60) was generated per file, but several targets are still
+scaffolds, so their ask has nothing to act on yet. Revisit after the phase that
+implements the file:
+
+- `src/source_map.rs` (#60 refactor, #50 docs) — 17-line stub; `resolve()` returns `None`
+  until Phase 3 (DWARF parsing, #43).
+- `src/aggregator.rs` (#52 refactor) — `aggregate()` is `unimplemented!()` until Phase 4.
+- `src/models.rs` (#59 perf) — derive-only data structures; no loops or clones to remove,
+  and the issue forbids changing the public API.
+- `src/lib.rs` (#51 perf) — module declarations only.
+- `tests/meter_probe.rs` (#56 refactor, #46 docs) — the file does not exist.
