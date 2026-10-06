@@ -2,19 +2,43 @@ use crate::models::{EventType, TraceEvent};
 use soroban_env_host::{Host, budget::AsBudget};
 use tracing::{debug, error, info, trace};
 
+/// Collects costed execution events while a WASM contract runs under `wasmi`.
+///
+/// The tracer is fed by the engine hooks in [`invoke_function`] and by
+/// [`instantiate_module`]; it owns no engine state itself, so it can be cloned,
+/// inspected, and drained independently of the run being profiled.
+///
+/// Two knobs bound the trace's size and cost, both inherited from the PRD's OOM
+/// constraints: [`with_sample_rate`] throttles how many `Step` events are emitted,
+/// and [`with_instruction_ceiling`] stops a runaway contract from buffering an
+/// unbounded number of events.
+///
+/// [`invoke_function`]: crate::tracer::invoke_function
+/// [`instantiate_module`]: crate::tracer::instantiate_module
+/// [`with_sample_rate`]: ExecutionTracer::with_sample_rate
+/// [`with_instruction_ceiling`]: ExecutionTracer::with_instruction_ceiling
 #[derive(Default, Debug, Clone)]
 pub struct ExecutionTracer {
+    /// Every event emitted so far, in execution order.
     pub events: Vec<TraceEvent>,
+    // Accumulated CPU cost required before the next `Step` event is emitted.
     sample_rate: u64,
+    // Hard limit on `record_step` calls; exceeding it aborts the trace.
     instruction_ceiling: u64,
+    // Steps recorded so far, counted regardless of whether they were sampled.
     instruction_count: u64,
+    // Cost carried forward from steps that have not crossed the sample threshold yet.
     current_step_cost: u64,
     current_mem_cost: u64,
+    // Budget counters captured at the matching `record_host_call`, so the host return
+    // can report the host function's own cost rather than the cumulative total.
     host_snapshot_cpu: u64,
     host_snapshot_mem: u64,
 }
 
 impl ExecutionTracer {
+    /// Create a tracer with the MVP defaults: sample every ~100 CPU units, and abort
+    /// past 100M instructions (the PRD's ceiling for a contract run).
     pub fn new() -> Self {
         Self {
             sample_rate: 100,
@@ -23,16 +47,38 @@ impl ExecutionTracer {
         }
     }
 
+    /// Set the CPU cost that must accumulate before a `Step` event is emitted.
+    ///
+    /// Lower means finer-grained cost attribution and more memory spent on the event
+    /// buffer; higher means a smaller trace at the cost of detail.
     pub fn with_sample_rate(mut self, sample_rate: u64) -> Self {
         self.sample_rate = sample_rate;
         self
     }
 
+    /// Set the maximum number of steps accepted before [`record_step`] starts failing.
+    ///
+    /// This is the protection against an infinite loop inside the profiled contract.
+    /// [`record_step`]: ExecutionTracer::record_step
     pub fn with_instruction_ceiling(mut self, ceiling: u64) -> Self {
         self.instruction_ceiling = ceiling;
         self
     }
 
+    /// Account for one executed instruction, emitting a `Step` event once enough cost
+    /// has accumulated to cross the sample threshold.
+    ///
+    /// Costs are carried forward between calls rather than dropped, so the sum of all
+    /// emitted `cpu_cost` values equals the total cost passed in (minus whatever is
+    /// still below threshold in the buffer at the end of the run). Saturation, not
+    /// wrapping, is deliberate: a contract that racks up absurd counters should show a
+    /// huge sampled cost, not silently roll over to a small one.
+    ///
+    /// Returns `Err` after the instruction ceiling is passed, which the caller should
+    /// treat as a halt signal — the trace up to that point is still valid and readable
+    /// via [`flush_trace`].
+    ///
+    /// [`flush_trace`]: ExecutionTracer::flush_trace
     pub fn record_step(
         &mut self,
         pc: usize,
@@ -64,6 +110,9 @@ impl ExecutionTracer {
         Ok(())
     }
 
+    /// Record entry into a WASM function. Emitted unconditionally: boundaries are the
+    /// spine of the call tree the aggregator later rebuilds, so sampling them would
+    /// lose frames entirely.
     pub fn record_call(&mut self, pc: usize, cpu_cost: u64, mem_cost: u64) {
         debug!("WASM Call at PC: {}", pc);
         self.events.push(TraceEvent {
@@ -74,6 +123,9 @@ impl ExecutionTracer {
         });
     }
 
+    /// Record exit from a WASM function, pairing with the nearest [`record_call`].
+    ///
+    /// [`record_call`]: ExecutionTracer::record_call
     pub fn record_return(&mut self, pc: usize, cpu_cost: u64, mem_cost: u64) {
         debug!("WASM Return at PC: {}", pc);
         self.events.push(TraceEvent {
@@ -84,6 +136,17 @@ impl ExecutionTracer {
         });
     }
 
+    /// Note that execution is entering the Soroban host, and snapshot the budget.
+    ///
+    /// The event itself carries zero cost: the host budget is cumulative, so the cost
+    /// of the host call is only knowable on return, as the delta from this snapshot in
+    /// [`record_host_return`]. Missing this snapshot would attribute every host call
+    /// since the start of the run to whichever function returns last.
+    ///
+    /// Budget reads are `unwrap_or(0)` — a host that cannot report its budget should
+    /// degrade into an uncosted trace, not abort the run being profiled.
+    ///
+    /// [`record_host_return`]: ExecutionTracer::record_host_return
     pub fn record_host_call(&mut self, pc: usize, host: &Host) {
         debug!("Host Call at PC: {}", pc);
         let budget = host.as_budget();
@@ -98,6 +161,14 @@ impl ExecutionTracer {
         });
     }
 
+    /// Close the host frame opened by [`record_host_call`], charging it the budget it
+    /// consumed while we were inside.
+    ///
+    /// Only the most recent snapshot is kept, which assumes host calls do not nest. If
+    /// a host function were to re-enter WASM, the inner return would overwrite the
+    /// outer snapshot and the outer cost would be reported against the wrong frame.
+    ///
+    /// [`record_host_call`]: ExecutionTracer::record_host_call
     pub fn record_host_return(&mut self, pc: usize, host: &Host) {
         debug!("Host Return at PC: {}", pc);
         let budget = host.as_budget();
@@ -115,16 +186,33 @@ impl ExecutionTracer {
         });
     }
 
+    /// Hand the accumulated events over to the next pipeline stage, leaving the tracer
+    /// empty.
+    ///
+    /// Use this when the trace is consumed; it avoids copying what can be up to 100M
+    /// events. [`trace`] is the non-destructive alternative for inspection and tests.
+    ///
+    /// [`trace`]: ExecutionTracer::trace
     pub fn flush_trace(&mut self) -> Vec<TraceEvent> {
         std::mem::take(&mut self.events)
     }
 
-    /// Traces the execution by initializing the engine, setting up hooks, and running.
+    /// Return a copy of the events recorded so far, keeping them in the buffer.
+    ///
+    /// Despite the name, this does not drive execution: the run is already being traced
+    /// by the engine hooks installed in [`invoke_function`], and this only reads what
+    /// they have collected.
+    ///
+    /// [`invoke_function`]: crate::tracer::invoke_function
     pub fn trace(&mut self) -> Vec<TraceEvent> {
         self.events.clone()
     }
 }
 
+/// Read a contract's WASM from disk, rejecting anything that is not a WASM module.
+///
+/// The four-byte magic check fails fast with a clear error; otherwise `wasmi` would
+/// surface a confusing parse failure on whatever file the user pointed us at.
 pub fn load_wasm_file(path: &str) -> std::io::Result<Vec<u8>> {
     info!("Loading WASM file from {}", path);
     let bytes = std::fs::read(path)?;
@@ -138,12 +226,20 @@ pub fn load_wasm_file(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Build a `wasmi` engine with fuel metering enabled.
+///
+/// Fuel is what makes costing possible at all: with `consume_fuel` off, the engine
+/// runs without counting instructions and there is nothing to attribute to a frame.
 pub fn setup_engine() -> wasmi::Engine {
     let mut config = wasmi::Config::default();
     config.consume_fuel(true);
     wasmi::Engine::new(&config)
 }
 
+/// Compile WASM bytes into a `wasmi` module ready for instantiation.
+///
+/// Validation happens here, so a malformed but magic-numbered file fails at this step
+/// rather than mid-trace.
 pub fn parse_module(
     engine: &wasmi::Engine,
     wasm_bytes: &[u8],
@@ -151,16 +247,34 @@ pub fn parse_module(
     wasmi::Module::new(engine, wasm_bytes)
 }
 
+/// Provide a host for traces that never touch chain state.
+///
+/// A default `Host` carries its own budget, which is what [`record_host_call`] and
+/// [`record_host_return`] read; profiling pure-computation contracts therefore needs
+/// no ledger setup.
+///
+/// [`record_host_call`]: ExecutionTracer::record_host_call
+/// [`record_host_return`]: ExecutionTracer::record_host_return
 pub fn setup_mock_env() -> Host {
     Host::default()
 }
 
+/// The `wasmi` store state the profiler needs reachable from inside engine callbacks.
 pub struct ProfilerState {
     pub tracer: ExecutionTracer,
     pub host: Host,
+    /// Reserved for fuel-delta step metering. The call hooks installed by
+    /// [`invoke_function`] cannot read remaining fuel, so nothing populates this yet.
+    ///
+    /// [`invoke_function`]: crate::tracer::invoke_function
     pub last_fuel: u64,
 }
 
+/// Instantiate a module and run its start function, with no host imports registered.
+///
+/// The linker is intentionally empty: the fixture contracts are pure computation, and
+/// any contract that imports a Soroban host function will fail here until the real host
+/// bindings are wired up.
 #[tracing::instrument(skip(engine, store, module))]
 pub fn instantiate_module(
     engine: &wasmi::Engine,
@@ -172,6 +286,23 @@ pub fn instantiate_module(
     linker.instantiate_and_start(store, module)
 }
 
+/// Run an exported function while recording the boundaries it crosses.
+///
+/// A call hook is installed on the store before the call, so every WASM/host entry and
+/// exit is turned into a tracer event as execution proceeds. Results are written into
+/// `results`, which the caller must size to the function's return arity.
+///
+/// Two known limitations, both traceable to what `wasmi` 2.0 exposes to a call hook:
+///
+/// * Every event is recorded at `pc = 0`. Real program counters are not available in
+///   the hook, so cost currently lands on function boundaries only and cannot be
+///   attributed to a source line until DWARF mapping arrives (Phase 3).
+/// * One synthetic step of cost 1 is recorded per boundary rather than per
+///   instruction, because there is no instruction-level hook. CPU cost therefore
+///   under-reports work done inside a function body; the host-budget deltas in
+///   [`record_host_return`] are the accurate part.
+///
+/// [`record_host_return`]: ExecutionTracer::record_host_return
 #[tracing::instrument(skip(store, instance, params, results))]
 pub fn invoke_function(
     store: &mut wasmi::Store<ProfilerState>,
@@ -182,13 +313,10 @@ pub fn invoke_function(
 ) -> Result<(), wasmi::Error> {
     info!("Invoking function: {}", func_name);
 
-    // Set up call hooks to intercept boundaries (Issues 40 and 42)
+    // Intercept call boundaries so the tracer sees the shape of the execution.
     store.call_hook(|state: &mut ProfilerState, hook_type| {
-        // Because we don't have direct access to store.get_fuel() inside the hook
-        // and we cannot predict how much fuel wasmi consumes between calls,
-        // we can simply emit the events.
-        // For accurate cpu_cost in steps (Issue 41), we rely on periodic fuel sampling if possible,
-        // but here we just trace boundaries.
+        // Remaining fuel is not reachable from inside this callback, so boundaries are
+        // recorded as events and costed from the host budget instead of from fuel.
         match hook_type {
             wasmi::CallHook::CallingWasm => {
                 state.tracer.record_call(0, 0, 0);
@@ -203,9 +331,8 @@ pub fn invoke_function(
                 state.tracer.record_host_return(0, &state.host);
             }
         }
-        // Issue 41: we record steps manually based on execution progress,
-        // Since wasmi 2.0.0 doesn't have an instruction hook, we fake a step
-        // to record CPU cost here at boundaries.
+        // `wasmi` 2.0.0 has no instruction hook, so a single unit-costed step stands in
+        // for the instructions run since the last boundary.
         let _ = state.tracer.record_step(0, 1, 0);
         Ok(())
     });
@@ -215,7 +342,6 @@ pub fn invoke_function(
         wasmi::Error::new(format!("Function '{}' not found", func_name))
     })?;
 
-    // We run the function directly.
     func.call(store, params, results)
 }
 

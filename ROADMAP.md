@@ -70,19 +70,20 @@
 - [x] Review and optimize performance/allocations in `src/formatter.rs` (#63)
 - [x] Improve inline documentation and comments in `src/aggregator.rs` (#62)
 - [x] Add comprehensive unit tests for `src/lib.rs` (#61)
+- [x] Add comprehensive unit tests for `src/formatter.rs` (#53)
+- [x] Improve inline documentation and comments in `src/tracer.rs` (#54)
+- [x] Add comprehensive unit tests for `fixtures/dummy-contract/src/lib.rs` (#57)
+- [x] Improve inline documentation and comments in `src/main.rs` (#58)
 
-## Metering Probes (`tests/meter_probe.rs`)
-- [x] Create the probe suite — `tests/meter_probe.rs` did not exist, which is why #46 and #56 had nothing to act on.
-- [x] Refactor and modularize complex logic in `tests/meter_probe.rs` (#56) — shared `Probe` harness, one job per test, WASM encoding isolated in `mod probe_module`.
-- [x] Improve inline documentation and comments in `tests/meter_probe.rs` (#46) — byte-level WASM annotations and the reason behind every assertion.
+### Blocked on unimplemented code
+The quality-issue bank (#45-#60) was generated per file, but several targets are still
+scaffolds, so their ask has nothing to act on yet. Revisit after the phase that
+implements the file:
 
-### Findings the probes surfaced, both blocking Phase 4
-- **Internal WASM calls are not traced.** `wasmi` 2.0's `Store::call_hook` fires only for the
-  host-initiated call: `probe()` calling `work()` twice yields one Call/Return pair, not three.
-  Phase 4's call tree cannot be rebuilt from boundaries the engine never reports. Pinned by
-  `only_the_outer_invocation_is_recorded_as_a_boundary`.
-- **The instruction ceiling cannot halt a run.** `invoke_function` discards the `Err` returned by
-  `record_step` once the ceiling is passed, so a runaway contract runs to completion. Pinned by
-  `the_instruction_ceiling_does_not_stop_execution`.
-- **A trapped run keeps its trace.** An out-of-fuel contract still yields the boundaries crossed
-  before the trap, which is what Phase 5's panic handling needs.
+- `src/source_map.rs` (#60 refactor, #50 docs) — 17-line stub; `resolve()` returns `None`
+  until Phase 3 (DWARF parsing, #43).
+- `src/aggregator.rs` (#52 refactor) — `aggregate()` is `unimplemented!()` until Phase 4.
+- `src/models.rs` (#59 perf) — derive-only data structures; no loops or clones to remove,
+  and the issue forbids changing the public API.
+- `src/lib.rs` (#51 perf) — module declarations only.
+- `tests/meter_probe.rs` (#56 refactor, #46 docs) — the file does not exist.
