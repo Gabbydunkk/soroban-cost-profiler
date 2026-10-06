@@ -55,9 +55,10 @@
 - [ ] **Address Resolution:** Implement the `resolve(pc)` function to translate a WASM Program Counter to a Rust `file:line` frame. Blocked upstream, not by DWARF: `wasmi` 2.0 gives a call hook no program counter and has no instruction hook, so every event the tracer records is at `pc = 0` — see the tracer's `invoke_function` docs and `only_the_outer_invocation_is_recorded_as_a_boundary`. Verified separately that DWARF line tables are code-section-relative (offsets `4`/`8`/`16`/`64` resolved to `src/lib.rs:2` and `:5`), so the missing piece is a real offset from the engine, plus Issue 22's offset translation once there is one.
 
 ## Phase 4: Aggregation & Formatting
-- [ ] **Tree Building:** Implement `ProfileAggregator` to consume the raw `TraceEvent` stream and build a `CallStackNode` tree.
-- [ ] **Cost Math:** Calculate `inclusive_cpu` and `exclusive_cpu` correctly during aggregation.
-- [ ] **Formatting:** Implement `OutputFormatter` to serialize the tree into the standard `.folded` collapsed stack format.
+- [x] **Tree Building:** Implement `ProfileAggregator` to consume the raw `TraceEvent` stream and build a `CallStackNode` tree (#52). Open frames live on a stack, so accounting allocates per call rather than per instruction (`AGENTS.md`'s OOM constraint); a frame that meets another of the same name pools into it, the way flamegraph consumers collapse repeated stack frames. Trapped runs keep their still-open frames and an unmatched `Return` is ignored, so a partial trace still renders.
+- [x] **Cost Math:** Exclusive cost accumulates on the innermost open frame; a `Call`'s delta is charged to its caller (or, for the stream's first boundary, to the frame it opens); host cost lands in its own frame because the tracer records zero on entry and the whole budget delta on return. `inclusive_*` is filled by one post-order pass over the finished tree, so `inclusive == exclusive + sum(children.inclusive)` holds at every node by construction — asserted for every frame in a mixed WASM/host/recursion trace.
+- [x] **Formatting:** Implement `OutputFormatter` to serialize the tree into the standard `.folded` collapsed stack format — written with #44/#53 and tested there; what was missing was an input, which Stage 3 now provides, so the call is live in `profile()` rather than commented out.
+- [x] **Pipeline Wiring:** `src/main.rs`'s `profile()` now runs all four stages in order instead of commenting the last two out, and `tests/integration.rs` hands a traced run through tracer → aggregator → formatter, reading the result back with `parse_folded`. The tree is a placeholder until Phases 2 and 3 give it real boundaries and names, so the end-to-end output is one unresolved `wasm[0]` frame holding the total.
 - [x] **Differential Comparison:** Diff two `.folded` artifacts into `<stack> <baseline> <current>` lines for `flamegraph.pl --diff`, with the red/blue/neutral classification tested in `src/formatter.rs` and `tests/differential.rs` (#44). Rendering stays an external step: `AGENTS.md` cuts SVG/inferno from the MVP.
 
 ## Phase 5: CLI & Edge Cases (MVP Completion)
@@ -96,6 +97,8 @@
 - [x] Refactor and modularize complex logic in `src/main.rs` (#48) — each pipeline stage now constructed by its own function behind a `profile()` harness, which is also the first test to execute the binary's code at all.
 - [x] Improve inline documentation and comments in `src/source_map.rs` (#50) — the stage's contract, what Phase 3 will hold, and the facts checked against real builds (section names, `from_sections` needs no `object`, code-section-relative addresses, the fixture currently shipping no DWARF). Documentation plus two tests pinning that construction tolerates a debug-info-free binary and that an unattributable `pc` yields no frame; `resolve()` itself stays blocked on the engine giving the tracer a real offset.
 
+- [x] Implement and refactor `src/aggregator.rs` (#52) — `aggregate()` was `unimplemented!()`; it now folds the flat event stream into the tree Phase 4 needs, which is also what the two open Phase 4 boxes above describe. 13 unit tests cover cost attribution, nesting, host frames, pooling, trapped runs, and the inclusive invariant.
+
 ### Blocked on unimplemented code
 The quality-issue bank (#45-#60) was generated per file, but several targets are still
 scaffolds, so their ask has nothing to act on yet. Revisit after the phase that
@@ -104,7 +107,6 @@ implements the file:
 - `src/source_map.rs` (#60 refactor) — a documented 17-line stub until Phase 3 implements
   `resolve()`; #50 documented it rather than restructuring it, because there is no logic yet to
   restructure.
-- `src/aggregator.rs` (#52 refactor) — `aggregate()` is `unimplemented!()` until Phase 4.
 - `src/models.rs` (#59 perf) — derive-only data structures; no loops or clones to remove,
   and the issue forbids changing the public API.
 - `src/lib.rs` (#51 perf) — module declarations only.
