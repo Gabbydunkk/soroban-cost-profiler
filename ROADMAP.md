@@ -70,3 +70,19 @@
 - [x] Review and optimize performance/allocations in `src/formatter.rs` (#63)
 - [x] Improve inline documentation and comments in `src/aggregator.rs` (#62)
 - [x] Add comprehensive unit tests for `src/lib.rs` (#61)
+
+## Metering Probes (`tests/meter_probe.rs`)
+- [x] Create the probe suite — `tests/meter_probe.rs` did not exist, which is why #46 and #56 had nothing to act on.
+- [x] Refactor and modularize complex logic in `tests/meter_probe.rs` (#56) — shared `Probe` harness, one job per test, WASM encoding isolated in `mod probe_module`.
+- [x] Improve inline documentation and comments in `tests/meter_probe.rs` (#46) — byte-level WASM annotations and the reason behind every assertion.
+
+### Findings the probes surfaced, both blocking Phase 4
+- **Internal WASM calls are not traced.** `wasmi` 2.0's `Store::call_hook` fires only for the
+  host-initiated call: `probe()` calling `work()` twice yields one Call/Return pair, not three.
+  Phase 4's call tree cannot be rebuilt from boundaries the engine never reports. Pinned by
+  `only_the_outer_invocation_is_recorded_as_a_boundary`.
+- **The instruction ceiling cannot halt a run.** `invoke_function` discards the `Err` returned by
+  `record_step` once the ceiling is passed, so a runaway contract runs to completion. Pinned by
+  `the_instruction_ceiling_does_not_stop_execution`.
+- **A trapped run keeps its trace.** An out-of-fuel contract still yields the boundaries crossed
+  before the trap, which is what Phase 5's panic handling needs.
