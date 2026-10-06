@@ -1,6 +1,6 @@
-use tracing::{debug, error, info, trace};
 use crate::models::{EventType, TraceEvent};
 use soroban_env_host::{Host, budget::AsBudget};
+use tracing::{debug, error, info, trace};
 
 /// Hooks into the WASM execution engine to emit `TraceEvent`s.
 pub struct ExecutionTracer {
@@ -10,7 +10,7 @@ pub struct ExecutionTracer {
     pub sample_rate: u64,
     pub instruction_count: u64,
     pub instruction_ceiling: u64,
-    
+
     // Snapshots of the host's budget
     pub host_snapshot_cpu: u64,
     pub host_snapshot_mem: u64,
@@ -40,20 +40,28 @@ impl ExecutionTracer {
         self.sample_rate = sample_rate;
         self
     }
-    
+
     pub fn with_instruction_ceiling(mut self, ceiling: u64) -> Self {
         self.instruction_ceiling = ceiling;
         self
     }
 
-    pub fn record_step(&mut self, pc: usize, cpu_cost: u64, mem_cost: u64) -> Result<(), &'static str> {
-        trace!("Stepping at PC: {}, cpu: {}, mem: {}", pc, cpu_cost, mem_cost);
+    pub fn record_step(
+        &mut self,
+        pc: usize,
+        cpu_cost: u64,
+        mem_cost: u64,
+    ) -> Result<(), &'static str> {
+        trace!(
+            "Stepping at PC: {}, cpu: {}, mem: {}",
+            pc, cpu_cost, mem_cost
+        );
         self.instruction_count = self.instruction_count.saturating_add(1);
         if self.instruction_count > self.instruction_ceiling {
             error!("Instruction ceiling exceeded at PC: {}", pc);
             return Err("Instruction ceiling exceeded");
         }
-        
+
         self.current_step_cost = self.current_step_cost.saturating_add(cpu_cost);
         self.current_mem_cost = self.current_mem_cost.saturating_add(mem_cost);
         if self.current_step_cost >= self.sample_rate {
@@ -88,13 +96,13 @@ impl ExecutionTracer {
             mem_cost,
         });
     }
-    
+
     pub fn record_host_call(&mut self, pc: usize, host: &Host) {
         debug!("Host Call at PC: {}", pc);
         let budget = host.as_budget();
         self.host_snapshot_cpu = budget.get_cpu_insns_consumed().unwrap_or(0);
         self.host_snapshot_mem = budget.get_mem_bytes_consumed().unwrap_or(0);
-        
+
         self.events.push(TraceEvent {
             pc,
             event_type: EventType::HostCall,
@@ -108,7 +116,7 @@ impl ExecutionTracer {
         let budget = host.as_budget();
         let current_cpu = budget.get_cpu_insns_consumed().unwrap_or(0);
         let current_mem = budget.get_mem_bytes_consumed().unwrap_or(0);
-        
+
         let diff_cpu = current_cpu.saturating_sub(self.host_snapshot_cpu);
         let diff_mem = current_mem.saturating_sub(self.host_snapshot_mem);
 
@@ -149,7 +157,10 @@ pub fn setup_engine() -> wasmi::Engine {
     wasmi::Engine::new(&config)
 }
 
-pub fn parse_module(engine: &wasmi::Engine, wasm_bytes: &[u8]) -> Result<wasmi::Module, wasmi::Error> {
+pub fn parse_module(
+    engine: &wasmi::Engine,
+    wasm_bytes: &[u8],
+) -> Result<wasmi::Module, wasmi::Error> {
     wasmi::Module::new(engine, wasm_bytes)
 }
 
@@ -177,12 +188,10 @@ pub fn invoke_function(
     results: &mut [wasmi::Val],
 ) -> Result<(), wasmi::Error> {
     info!("Invoking function: {}", func_name);
-    let func = instance
-        .get_func(&mut *store, func_name)
-        .ok_or_else(|| {
-            error!("Function '{}' not found", func_name);
-            wasmi::Error::new(format!("Function '{}' not found", func_name))
-        })?;
+    let func = instance.get_func(&mut *store, func_name).ok_or_else(|| {
+        error!("Function '{}' not found", func_name);
+        wasmi::Error::new(format!("Function '{}' not found", func_name))
+    })?;
     func.call(store, params, results)
 }
 
@@ -228,12 +237,12 @@ mod tests {
     fn test_record_host_call_and_return() {
         let mut tracer = ExecutionTracer::new().with_sample_rate(100);
         let host = setup_mock_env();
-        
+
         tracer.record_host_call(1, &host);
-        
+
         let _ = host.as_budget().charge(
             soroban_env_host::xdr::ContractCostType::WasmInsnExec,
-            Some(100)
+            Some(100),
         );
 
         tracer.record_host_return(2, &host);
@@ -241,7 +250,7 @@ mod tests {
         assert_eq!(tracer.events.len(), 2);
         assert_eq!(tracer.events[0].event_type, EventType::HostCall);
         assert_eq!(tracer.events[1].event_type, EventType::HostReturn);
-        assert_eq!(tracer.events[1].cpu_cost, 0); 
+        assert_eq!(tracer.events[1].cpu_cost, 0);
         assert_eq!(tracer.events[1].mem_cost, 0);
     }
 
@@ -262,15 +271,15 @@ mod recursive_tests {
     fn test_recursive_function_calls() {
         let mut tracer = ExecutionTracer::new().with_sample_rate(100);
         let depth = 1000;
-        
+
         for i in 0..depth {
             tracer.record_call(i, 5, 2);
         }
-        
+
         for i in (0..depth).rev() {
             tracer.record_return(i, 5, 2);
         }
-        
+
         assert_eq!(tracer.events.len(), 2000);
         assert_eq!(tracer.events[0].event_type, EventType::Call);
         assert_eq!(tracer.events[1999].event_type, EventType::Return);
