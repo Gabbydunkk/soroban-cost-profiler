@@ -5,11 +5,15 @@ use std::collections::HashMap;
 /// * `Call`: Indicates that execution has crossed a function boundary into a new frame.
 /// * `Return`: Indicates that the current function frame has exited.
 /// * `Step`: Indicates that a WASM instruction (or sequence of instructions) was executed.
+/// * `HostCall`: A call from WASM to a host-provided function (e.g., Soroban environment).
+/// * `HostReturn`: Return from a host-provided function back to WASM.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventType {
     Call,
     Return,
     Step,
+    HostCall,
+    HostReturn,
 }
 
 /// A snapshot of execution state emitted by the `ExecutionTracer`.
