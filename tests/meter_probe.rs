@@ -290,8 +290,11 @@ fn an_out_of_fuel_run_leaves_a_partial_trace() {
         "{} fuel is one unit short of the {full} a full run costs, so it should trap",
         full - 1
     ));
-    assert!(
-        error.to_string().contains("fuel"),
+    // The trap code, not the message: `Display` for this error is `wasmi`'s to reword, and a
+    // substring match on "fuel" would also pass if an unrelated error happened to mention it.
+    assert_eq!(
+        error.as_trap_code(),
+        Some(wasmi::TrapCode::OutOfFuel),
         "expected an out-of-fuel trap, got: {error}"
     );
     assert_eq!(
