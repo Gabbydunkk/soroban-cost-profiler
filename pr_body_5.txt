@@ -1,0 +1,23 @@
+This PR resolves the final 5 Phase 2 execution tasks: budget tracking, integration testing, and core loop benchmarking.
+
+### 🚀 Changes
+
+1. **Host Boundary Budgets**
+   - Wired `MockHost` into the `ExecutionTracer` natively, mapping CPU/Mem snapshots explicitly on `record_host_call` and `record_host_return`. (Closes #26)
+
+2. **Mock Ledger Setup**
+   - Outfitted `MockHost` as a lightweight state vessel representing the native ledger environment. (Closes #27)
+
+3. **Instruction Ceiling Protection**
+   - Added an `instruction_count` accumulator and an `instruction_ceiling` bound (default: 100M).
+   - Augmented `record_step` to gracefully yield an `Err` if the ceiling is exceeded, preventing malicious contracts from trapping the tracer in infinite hot loops. (Closes #28)
+
+4. **Integration Testing**
+   - Added `tests/integration.rs` covering the full end-to-end pipeline: parsing, instantiation, and runtime tracer stepping using a minimal compiled WASM fixture. (Closes #29)
+
+5. **Tracer Benchmark**
+   - Set up `cargo bench` scaffolding using the `criterion` crate in `Cargo.toml`.
+   - Created `benches/tracer_benchmark.rs` to measure the overhead of `record_step` at the lowest instruction levels. (Closes #30)
+
+6. **Roadmap Updates**
+   - Checked off the newly finalized milestones in `ROADMAP.md`!
