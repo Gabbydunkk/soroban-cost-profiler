@@ -1,0 +1,4 @@
+main 10
+main;compute_heavy_loop 60000
+main;memory_heavy_loop 4000
+main;added_helper 900
