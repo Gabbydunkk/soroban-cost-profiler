@@ -42,6 +42,7 @@
 - [ ] **Tree Building:** Implement `ProfileAggregator` to consume the raw `TraceEvent` stream and build a `CallStackNode` tree.
 - [ ] **Cost Math:** Calculate `inclusive_cpu` and `exclusive_cpu` correctly during aggregation.
 - [ ] **Formatting:** Implement `OutputFormatter` to serialize the tree into the standard `.folded` collapsed stack format.
+- [x] **Differential Comparison:** Diff two `.folded` artifacts into `<stack> <baseline> <current>` lines for `flamegraph.pl --diff`, with the red/blue/neutral classification tested in `src/formatter.rs` and `tests/differential.rs` (#44). Rendering stays an external step: `AGENTS.md` cuts SVG/inferno from the MVP.
 
 ## Phase 5: CLI & Edge Cases (MVP Completion)
 - [ ] **CLI Parsing:** Add `clap` to `src/main.rs` to accept `--wasm`, `--output`, and test arguments.
@@ -74,6 +75,9 @@
 - [x] Improve inline documentation and comments in `src/tracer.rs` (#54)
 - [x] Add comprehensive unit tests for `fixtures/dummy-contract/src/lib.rs` (#57)
 - [x] Improve inline documentation and comments in `src/main.rs` (#58)
+- [x] Add comprehensive unit tests for `src/models.rs` (#49) — the derived semantics Phase 4 depends on: distinct `EventType` variants, field-by-field `TraceEvent` equality, `SourceFrame`'s independent `Option` location fields, and `CallStackNode` children keyed by function name.
+- [x] Add comprehensive unit tests for `tests/integration.rs` (#45) — the seams around a run: `parse_module`/`load_wasm_file` error paths, fuel metering actually enabled, and the sampling and ceiling knobs.
+- [x] Refactor and modularize complex logic in `src/main.rs` (#48) — each pipeline stage now constructed by its own function behind a `profile()` harness, which is also the first test to execute the binary's code at all.
 
 ### Blocked on unimplemented code
 The quality-issue bank (#45-#60) was generated per file, but several targets are still
@@ -86,6 +90,17 @@ implements the file:
 - `src/models.rs` (#59 perf) — derive-only data structures; no loops or clones to remove,
   and the issue forbids changing the public API.
 - `src/lib.rs` (#51 perf) — module declarations only.
+
+### Not applicable as written
+Two bank items ask for something that would make the code worse, so they are recorded here
+rather than "solved" with a cosmetic diff:
+
+- `fixtures/dummy-contract/src/lib.rs` (#47 perf) — the deliberately expensive loops *are*
+  the fixture: `compute_heavy_loop` and `memory_heavy_loop` exist to produce measurable cost
+  for the profiler. Optimizing them would remove the signal every trace test depends on, and
+  #57 pinned their exact arithmetic.
+- `tests/integration.rs` (#55 perf) — a test file with no loop, clone, or allocation to
+  remove. #45 expanded it; there is nothing for a performance pass to do to it.
 
 ## Metering Probes (`tests/meter_probe.rs`)
 - [x] Create the probe suite — `tests/meter_probe.rs` did not exist, which is why #46 and #56 had nothing to act on.
