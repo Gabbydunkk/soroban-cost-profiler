@@ -295,7 +295,7 @@ mod tests {
 
     /// Stage 2 resolves nothing yet, so every frame in these tests is named by its `pc`.
     fn aggregate(events: Vec<TraceEvent>) -> CallStackNode {
-        ProfileAggregator::new().aggregate(events, &SourceMapper::new(&[]))
+        ProfileAggregator::new().aggregate(events, &SourceMapper::unmapped())
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
             ]
         };
 
-        let mapper = SourceMapper::new(&[]);
+        let mapper = SourceMapper::unmapped();
         let mut aggregator = ProfileAggregator::new();
         let first = aggregator.aggregate(nested(), &mapper);
         let second = aggregator.aggregate(nested(), &mapper);

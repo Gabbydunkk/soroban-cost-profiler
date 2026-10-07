@@ -1,1 +1,7 @@
 /target
+
+# `fixtures/dwarf_probe` is its own workspace root (see its `Cargo.toml`), so it builds a target
+# dir and a lock file next to the two committed artifacts this repo tracks. The crate has no
+# dependencies, so neither file carries information worth committing.
+fixtures/dwarf_probe/target/
+fixtures/dwarf_probe/Cargo.lock

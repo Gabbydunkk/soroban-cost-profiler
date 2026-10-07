@@ -1,4 +1,81 @@
 use crate::models::SourceFrame;
+use std::rc::Rc;
+
+/// The reader type `addr2line` is instantiated with.
+///
+/// An `Rc`-backed slice rather than `EndianSlice<'a, ..>`: the mapper has to own the section
+/// bytes, because the bytes it symbolizes against are read once from the binary and the
+/// `Context` then serves a whole trace. A borrowed reader would tie the mapper's lifetime to
+/// the buffer the caller passed to [`SourceMapper::new`].
+type Reader = gimli::EndianRcSlice<gimli::NativeEndian>;
+
+type Dwarf = gimli::Dwarf<Reader>;
+type Context = addr2line::Context<Reader>;
+
+/// Why a binary could not be symbolized, in the user's terms.
+///
+/// Every variant's message names the flag or the file that fixes it: this error is what a
+/// contract author reads when the flamegraph comes out unnamed, and "invalid DWARF" alone
+/// tells them nothing actionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceMapError {
+    /// The bytes are not a WASM module — too short to hold a header, or the wrong magic.
+    NotWasm,
+    /// A section header claimed more bytes than the file contains, i.e. a truncated download
+    /// or a partial write rather than a malformed build.
+    Truncated,
+    /// A valid module with no `.debug_info` section, which is the ordinary case for a release
+    /// build: `debug` is off for `release` by default, so nothing was emitted to map.
+    MissingDebugInfo {
+        /// Custom sections that *were* present, so the message can point out a `name` section
+        /// worth falling back to (see the function-name-only path in Phase 3's fallback chain).
+        custom_sections: Vec<String>,
+    },
+    /// DWARF sections are present but `gimli` could not read them — an incomplete build, an
+    /// unsupported DWARF version, or a section that was stripped after linking.
+    UnreadableDwarf { reason: String },
+}
+
+impl std::fmt::Display for SourceMapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotWasm => write!(
+                f,
+                "not a WebAssembly module: expected the 8-byte header `\\0asm\\x01\\0\\0\\0`. \
+                 Pass the `.wasm` file itself, not a `.wat` text file or an archive."
+            ),
+            Self::Truncated => write!(
+                f,
+                "WebAssembly module ended in the middle of a section. Re-download or rebuild it: \
+                 a truncated file cannot be mapped, and would fail to instantiate too."
+            ),
+            Self::MissingDebugInfo { custom_sections } => {
+                write!(
+                    f,
+                    "no `.debug_info` section, so program counters cannot be mapped to Rust \
+                     source lines. Build the contract with debug info enabled — \
+                     `[profile.release] debug = \"line-tables-only\"` is enough for `file:line` \
+                     frames — and profile that artifact rather than the stripped one \
+                     (`wasm-opt`, and `stellar contract build`, strip debug info)."
+                )?;
+                if custom_sections.is_empty() {
+                    write!(f, " The module carries no custom sections at all.")?;
+                } else {
+                    write!(f, " Sections present: {}.", custom_sections.join(", "))?;
+                }
+                Ok(())
+            }
+            Self::UnreadableDwarf { reason } => write!(
+                f,
+                "the binary has DWARF sections but they could not be read ({reason}). \
+                 This usually means the artifact was partially stripped or built with an \
+                 unsupported DWARF version; rebuild it from source."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceMapError {}
 
 /// Stage 2 of the pipeline: turn a program counter into a Rust source frame.
 ///
@@ -12,62 +89,59 @@ use crate::models::SourceFrame;
 /// from the location: a stripped binary can still yield a function name, and a line table
 /// can still yield a line with no name.
 ///
-/// # Status: scaffold (Phase 3 of `ROADMAP.md`)
+/// # What it holds
 ///
-/// `new` stores nothing and `resolve` resolves nothing, so Stages 3 and 4 can be written
-/// against a stable surface while the DWARF work lands behind it. Two consequences callers
-/// have to live with today:
+/// An `addr2line::Context` built from the DWARF custom sections of the binary that was loaded
+/// ([`SourceMapper::new`]), or nothing at all ([`SourceMapper::unmapped`]) for a caller that
+/// chose to continue without symbols. Construction is fallible and reports *why* there are no
+/// symbols, because "the binary has no debug info" and "the address is outside every range"
+/// need different fixes and only the first is the user's to make.
 ///
-/// * Every `pc` resolves to `None`, so an aggregated tree can only be keyed by the names the
-///   tracer already knows.
-/// * Construction is infallible, so "this binary has no debug info" and "this address is not
-///   inside any range" are not yet distinguishable. [`docs/issues/phase_3_issues.md`]
-///   (issues 3 and 8) plans a fallible `load_dwarf_sections` whose error tells the user to
-///   check their compilation flags; making `new` return `Result` is that issue's call to
-///   make, not a change to smuggle in here.
+/// The facts below were checked against real builds rather than assumed, because each one
+/// decided how much code Phase 3 is:
 ///
-/// # What it will hold, and the facts that shape it
+/// * **DWARF arrives as separate WASM custom sections, so loading is a section walk.** A
+///   `wasm32-unknown-unknown` build with debug info carries `.debug_abbrev`, `.debug_info`,
+///   `.debug_str`, `.debug_line`, `.debug_ranges` (and `.debug_loc` where applicable) as
+///   individual custom sections, alongside `name`, `producers`, `target_features` and
+///   Soroban's `contractspecv0`. They are not merged into one `DWARF` section, so
+///   `ROADMAP.md`'s "parse the `.debug_info` and `.debug_line` sections" is literally right,
+///   and the only hand-written parsing here is the WASM section table — never DWARF itself.
+///   `AGENTS.md`'s "no custom DWARF parsing" rule holds: `gimli::Dwarf::load` reads the
+///   sections, `addr2line::Context::from_dwarf` builds the index.
+/// * **`addr2line` needs no file wrapper and adds no dependency weight.** Its
+///   `default-features = false, features = ["std", "rustc-demangle"]` build pulls neither
+///   `object` nor `cpp_demangle` nor `memmap2`, and both it and `gimli` were already in
+///   `Cargo.lock` via `backtrace`.
+/// * **`gimli` has to be a direct dependency anyway.** `addr2line` exposes `gimli` only as a
+///   re-export of its own instantiation, and that build enables `features = ["read"]`, which
+///   omits `endian-reader` — so `addr2line::gimli::EndianRcSlice`, the owned reader a mapper
+///   that outlives the caller's buffer needs, does not exist through it. Naming gimli in
+///   `Cargo.toml` adds `endian-reader` and `std` to the same 0.32.3 already resolved, and `std`
+///   is not optional here: `EndianRcSlice` only implements `gimli::Reader` once
+///   `stable_deref_trait`'s `std` feature gives `Rc<[u8]>: CloneStableDeref`. The whole footprint
+///   is those two small pure-Rust crates entering `Cargo.lock`.
+/// * **Debug info costs more than the contract.** The same fixture is 3.1 KB stripped and 622 KB
+///   with `debug = "line-tables-only"` — 619 KB of which is DWARF custom sections against a
+///   488-byte code section — because a `std`-linked build emits debug info for every inlined
+///   dependency, not just the contract's own functions. That is the price of profiling a real
+///   Soroban build, and it is why `fixtures/build.sh`'s output is a *profiling input*, never
+///   something to deploy. A `#![no_std]` crate with `panic = "abort"` shows the floor: the
+///   same three functions cost 1.7 KB total.
+/// * **DWARF addresses are code-section-relative, and `wasmi` never hands us one.** Looking up
+///   `4`, `8` and `16` in that build returned `src/lib.rs:2` (the function's signature) and
+///   `64` returned `src/lib.rs:5` (its loop body) — offsets into the code section, matching
+///   #153's translation note. [`SourceMapper::resolve`] still returns `None` for every
+///   address because the *other* half is missing: `wasmi` 2.0 gives a call hook no program
+///   counter and offers no instruction hook at all, so every event `invoke_function` records is
+///   written at `pc = 0`. See [`invoke_function`] for what the hooks can and cannot see.
+/// * **The `name` section survives this build path**, so a function-name-only fallback is real
+///   (#157); a plain `cargo build` does not strip it, while
+///   `stellar contract build` does. That is the precedence the docs should describe: DWARF ->
+///   `name` -> function index.
 ///
-/// An `addr2line::Context` over the DWARF of the binary that was loaded. The following were
-/// checked against real builds rather than assumed, because each one decides how much code
-/// Phase 3 is:
-///
-/// * **Rust emits DWARF as separate custom sections, so Phase 3 is a section walk.** A
-///   `wasm32-unknown-unknown` release build of a crate with `debug = 2` in
-///   `[profile.release]` carries `.debug_abbrev`, `.debug_info`, `.debug_str`,
-///   `.debug_line`, `.debug_loc` and `.debug_ranges` as individual WASM custom sections
-///   (alongside `name`, `producers` and `target_features`). They are not merged into a
-///   single `DWARF` section, so `ROADMAP.md`'s "parse the `.debug_info` and `.debug_line`
-///   sections" is literally right.
-/// * **`AGENTS.md`'s "no custom DWARF parsing" rule is satisfiable.** `addr2line` 0.25's
-///   [`addr2line::Context::from_sections`] takes each section as a `gimli` reader over raw
-///   bytes and needs no `object`/`memmap2` file wrapper, so the only hand-written code is
-///   the section scan itself. Both `addr2line` 0.25.1 and `gimli` 0.32.3 are already in
-///   `Cargo.lock` (pulled in by `backtrace`) with default features off, so using that
-///   constructor adds no new transitive dependencies — and keeps `cpp_demangle` out of the
-///   graph, which is right for a profiler that only demangles Rust symbols.
-/// * **DWARF addresses are code-section-relative, and `wasmi` never hands us one.** In that
-///   same build, looking up `4`, `8` and `16` returned `src/lib.rs:2` (the function's
-///   signature) and `64` returned `src/lib.rs:5` (its loop body) — small integers that are
-///   offsets into the code section, matching the issue bank's Issue 22. The reason this
-///   stage still returns `None` is upstream: `wasmi` 2.0 gives a call hook no program
-///   counter and offers no instruction hook at all, so every event `invoke_function`
-///   records is written at `pc = 0`. There is nothing to look up until the engine gives the
-///   tracer a real offset; see [`invoke_function`] for what the hooks can and cannot see.
-/// * **The fixture has no DWARF to map yet.** `fixtures/build.sh` inherits the root
-///   `[profile.release]`, which sets only `opt-level = "z"`, and the resulting
-///   `dummy_contract.wasm` is 3.1 KB with no `.debug_*` section at all. A Phase 3 test that
-///   asserts `file:line` needs debug info turned on for the fixture first — which is also
-///   what Issue 0's "does it survive `wasm-opt`?" question is about.
-/// * **The `name` section survives this build path, so Issue 26's fallback is real.** The
-///   same DWARF-free fixture does carry a `name` custom section (1.6 KB, against a 488-byte
-///   code section), which is what a function-name-only fallback would read when the line
-///   tables are gone. That is the precedence the eventual docs should describe (DWARF ->
-///   `name` -> function index, Issue 32) — noting that a plain `cargo build`, which is what
-///   `build.sh` runs, does not strip it, while the `stellar contract build` path is
-///   Issue 0's open question.
-///
-/// Two traps the first real `resolve` will hit, both seen in that probe:
+/// Two traps the resolution issues will hit, both seen in the probe that produced the numbers
+/// above:
 ///
 /// * A location can carry a file and *no* line: address `32` came back as
 ///   `file: Some(".../src/lib.rs"), line: None`. `SourceFrame`'s `Option` location fields are
@@ -82,40 +156,100 @@ use crate::models::SourceFrame;
 ///
 /// [`ProfileAggregator::aggregate`]: crate::aggregator::ProfileAggregator::aggregate
 /// [`invoke_function`]: crate::tracer::invoke_function
-/// [`docs/issues/phase_3_issues.md`]: https://github.com/Tollcraft/soroban-cost-profiler/blob/main/docs/issues/phase_3_issues.md
-/// [`addr2line::Context::from_sections`]: https://docs.rs/addr2line/0.25/addr2line/struct.Context.html#method.from_sections
+/// [`SourceMapper::new`]: SourceMapper::new
+/// [`SourceMapper::unmapped`]: SourceMapper::unmapped
+/// [`SourceMapper::resolve`]: SourceMapper::resolve
 pub struct SourceMapper {
-    // TODO(Phase 3): the `addr2line::Context` built from the sections above, and — if Issue
-    // 27 lands with it — the pc -> frame cache. `Context` is expensive to construct and
-    // independent of the run, so it is owned here rather than rebuilt per lookup.
+    context: Option<Context>,
 }
 
 impl SourceMapper {
-    /// Build a mapper for one already-loaded WASM binary.
+    /// Build a mapper for one already-loaded WASM binary, reading its DWARF.
     ///
-    /// Takes bytes rather than a path because [`load_wasm_file`] has already read and
-    /// validated the file, and the same bytes are handed to `parse_module` — reading twice
-    /// would let the traced binary and the symbolized binary disagree.
+    /// Takes bytes rather than a path because [`load_wasm_file`] has already read and validated
+    /// the file, and the same bytes are handed to `parse_module` — reading twice would let the
+    /// traced binary and the symbolized binary disagree.
     ///
-    /// Infallible today, and `main` depends on that: `load_source_mapper` builds the
-    /// stage-2 placeholder with `SourceMapper::new(&[])`. A Phase 3 `new` that rejects
-    /// binaries without debug info has to keep an empty input from panicking, or update
-    /// that call site.
+    /// The `Context` is built here rather than on first lookup: it walks every compilation unit,
+    /// which is expensive, and a trace then reads it millions of times. A caller that cannot
+    /// afford to fail on a binary without symbols should match on [`SourceMapError`] and fall
+    /// back to [`SourceMapper::unmapped`] — the profiler's job is to keep running and say why
+    /// frames are unnamed, not to abort the run being measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceMapError`] when the bytes are not a module ([`SourceMapError::NotWasm`],
+    /// [`SourceMapError::Truncated`]) or carry no usable DWARF
+    /// ([`SourceMapError::MissingDebugInfo`], [`SourceMapError::UnreadableDwarf`]). Each message
+    /// names the flag or step that would fix it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use soroban_cost_profiler::source_map::{SourceMapper, SourceMapError};
+    ///
+    /// // A release build with debug info off is the ordinary case, and it is an error worth
+    /// // reporting: the flamegraph will be unnamed, and only the user can fix the build.
+    /// let stripped = include_bytes!("../fixtures/dwarf_probe/dwarf_probe_no_debug.wasm");
+    /// let error = SourceMapper::new(stripped).err().expect("this fixture ships without DWARF");
+    /// assert!(matches!(error, SourceMapError::MissingDebugInfo { .. }));
+    ///
+    /// // The same functions built with `debug = 1` load, and the difference is the point.
+    /// let mapped = SourceMapper::new(include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm"));
+    /// assert!(mapped.unwrap().has_debug_info());
+    /// ```
     ///
     /// [`load_wasm_file`]: crate::tracer::load_wasm_file
-    pub fn new(_wasm_bytes: &[u8]) -> Self {
-        Self {}
+    pub fn new(wasm_bytes: &[u8]) -> Result<Self, SourceMapError> {
+        let sections = WasmSections::parse(wasm_bytes)?;
+
+        // `.debug_info` is what makes the other sections meaningful; a module that has line
+        // tables but no compilation units cannot yield a function name.
+        if sections.get(DEBUG_INFO).is_none() {
+            return Err(SourceMapError::MissingDebugInfo {
+                custom_sections: sections.custom_names(),
+            });
+        }
+
+        let context = Context::from_dwarf(load_dwarf(&sections)).map_err(|error| {
+            SourceMapError::UnreadableDwarf {
+                reason: error.to_string(),
+            }
+        })?;
+
+        Ok(Self {
+            context: Some(context),
+        })
+    }
+
+    /// A mapper that resolves nothing, for a run that continues without symbols.
+    ///
+    /// This is the degraded-but-working path: Stages 3 and 4 still produce a tree, keyed by the
+    /// `wasm[pc]` / `host[pc]` names the tracer already has. `main`'s harness uses it because it
+    /// has no binary to read yet — Phase 5's CLI replaces it with [`SourceMapper::new`] plus the
+    /// warning the returned error carries.
+    pub fn unmapped() -> Self {
+        Self { context: None }
+    }
+
+    /// Whether this mapper has DWARF to resolve against.
+    ///
+    /// Lets a caller distinguish "no frames because nothing was attributed" from "no frames
+    /// because no symbols were loaded" — the difference between a bug in the profiler and a
+    /// user's missing build flag, which the CLI has to report.
+    pub fn has_debug_info(&self) -> bool {
+        self.context.is_some()
     }
 
     /// Resolve one program counter to the source frame that produced it.
     ///
-    /// Returns `None` whenever the address cannot be attributed to a source line — no DWARF,
-    /// an address outside every range, or a pc that was never a real offset. It never
-    /// panics and never returns a half-filled frame, because aggregation calls this for
-    /// every event: a frame with an empty function name would add an anonymous root to the
-    /// tree and silently absorb the cost of everything unattributed.
+    /// Returns `None` whenever the address cannot be attributed to a source line — no DWARF, an
+    /// address outside every range, or a pc that was never a real offset. It never panics and
+    /// never returns a half-filled frame, because aggregation calls this for every event: a frame
+    /// with an empty function name would add an anonymous root to the tree and silently absorb
+    /// the cost of everything unattributed.
     ///
-    /// Takes `&self`, so one mapper can serve a whole trace, and Issue 27's cache would make
+    /// Takes `&self`, so one mapper can serve a whole trace, and #158's cache would make it
     /// `&mut self` — a change to weigh against `aggregate` holding `&SourceMapper`.
     ///
     /// # Examples
@@ -123,41 +257,357 @@ impl SourceMapper {
     /// ```
     /// use soroban_cost_profiler::source_map::SourceMapper;
     ///
-    /// // A binary with no debug info resolves nothing, and must not panic.
-    /// let mapper = SourceMapper::new(&[]);
+    /// // A mapper without symbols resolves nothing, and must not panic.
+    /// let mapper = SourceMapper::unmapped();
     /// assert!(mapper.resolve(0).is_none());
     /// ```
     pub fn resolve(&self, _pc: usize) -> Option<SourceFrame> {
-        // TODO(Phase 3): translate the pc to a code-section offset (Issue 22), query the
-        // addr2line context, demangle (Issue 23) and collapse closures (Issue 24).
+        // The context is loaded and ready. What is missing is an address worth querying it with:
+        // `wasmi` gives the tracer no program counter (see the module docs), and the offsets it
+        // does report would still need #153's translation to code-section-relative form.
+        // Phase 3's `Map WASM PC to File Path / Line Number / Function Name` issues fill this in
+        // against the fixture that now carries real DWARF.
         None
     }
+}
+
+/// The section whose absence means the binary cannot be source-mapped at all.
+///
+/// Line tables alone cannot name a function, and an address only resolves through a compilation
+/// unit, so `.debug_info` is what makes the other `.debug_*` sections meaningful.
+const DEBUG_INFO: &str = ".debug_info";
+
+/// DWARF section names, as they appear in a WASM custom section.
+///
+/// Rust emits each section as its own custom section rather than one merged `DWARF` blob, so
+/// [`WasmSections::parse`] can hand gimli exactly the bytes [`gimli::SectionId::name`] asks for.
+/// A lookup miss returns empty bytes, which is how gimli is told "this optional section does not
+/// exist" — DWARF 4 builds have no `.debug_line_str`, `.debug_addr` or `.debug_str_offsets`.
+///
+/// Infallible by construction: `Dwarf::load` only fails through the closure, and copying bytes
+/// into an owned reader cannot fail. What *can* fail is reading the contents, which is
+/// [`addr2line::Context::from_dwarf`]'s error and the caller's to report.
+fn load_dwarf(sections: &WasmSections) -> Dwarf {
+    // Copied per section, once, at load: the mapper outlives the caller's buffer, so the bytes
+    // it indexes have to be owned.
+    let reader =
+        |bytes: &[u8]| Reader::new(Rc::from(bytes.to_vec()), gimli::NativeEndian::default());
+
+    Dwarf::load(&mut |id: gimli::SectionId| {
+        Ok::<_, std::convert::Infallible>(reader(sections.get(id.name()).unwrap_or(&[])))
+    })
+    .expect("copying section bytes into a reader cannot fail")
+}
+
+/// The custom sections a mapper keeps, in file order.
+struct WasmSections {
+    /// `(name, payload)`, holding only the sections this stage can use: `.debug_*` for source
+    /// mapping and `name` for the function-name-only fallback. Everything else — `producers`,
+    /// `target_features`, Soroban's `contractspecv0` — would be a copy of bytes nothing reads.
+    retained: Vec<(String, Vec<u8>)>,
+}
+
+impl WasmSections {
+    /// Walk the WASM section table, keeping the sections Stage 2 reads.
+    ///
+    /// A hand-written parser for the *container* only: section id, payload length, and for
+    /// custom sections the name prefix. That is the whole module structure `addr2line` needs and
+    /// it never inspects DWARF itself, which is what keeps this inside `AGENTS.md`'s "no custom
+    /// DWARF parsing" rule. Deliberately strict about truncation and lenient about everything
+    /// else: a module with sections this stage ignores still maps fine.
+    fn parse(bytes: &[u8]) -> Result<Self, SourceMapError> {
+        if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+            return Err(SourceMapError::NotWasm);
+        }
+
+        let mut cursor = 8; // past magic and version
+        let mut retained = Vec::new();
+
+        while cursor < bytes.len() {
+            let id = Self::read_uleb(bytes, &mut cursor)?;
+            let size = usize::try_from(Self::read_uleb(bytes, &mut cursor)?)
+                .map_err(|_| SourceMapError::Truncated)?;
+            let end = cursor.checked_add(size).ok_or(SourceMapError::Truncated)?;
+            if end > bytes.len() {
+                return Err(SourceMapError::Truncated);
+            }
+
+            // Section id 0 is a custom section: its payload is a name then the data.
+            if id == 0 {
+                let name_len = usize::try_from(Self::read_uleb(bytes, &mut cursor)?)
+                    .map_err(|_| SourceMapError::Truncated)?;
+                let name_start = cursor;
+                let name_end = cursor
+                    .checked_add(name_len)
+                    .ok_or(SourceMapError::Truncated)?;
+                if name_end > end {
+                    return Err(SourceMapError::Truncated);
+                }
+                let name = std::str::from_utf8(&bytes[name_start..name_end])
+                    .map_err(|_| SourceMapError::Truncated)?
+                    .to_string();
+
+                if retain(&name) {
+                    // The section's own data starts after the name bytes, not after the length.
+                    retained.push((name, bytes[name_end..end].to_vec()));
+                }
+            }
+
+            cursor = end;
+        }
+
+        Ok(Self { retained })
+    }
+
+    /// Read a LEB128 unsigned integer, advancing the cursor.
+    ///
+    /// Rejects a byte that would overflow `u64` and a run that ends at the file's
+    /// [`SourceMapError::Truncated`] rather than reading past the end or wrapping silently.
+    fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, SourceMapError> {
+        let mut value: u64 = 0;
+        let mut shift = 0;
+
+        loop {
+            let byte = *bytes.get(*cursor).ok_or(SourceMapError::Truncated)?;
+            *cursor += 1;
+
+            if shift >= 64 || (byte & 0x7f) as u64 > u64::MAX >> shift {
+                return Err(SourceMapError::Truncated);
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        self.retained
+            .iter()
+            .find(|(section, _)| section == name)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Names of the custom sections that were kept, for the error message that tells a user what
+    /// their build actually contains.
+    ///
+    /// Only retained sections appear: the point of the list is "no `.debug_*` here, but there is
+    /// a `name` section to fall back to", and `producers`/`target_features` would be noise.
+    fn custom_names(&self) -> Vec<String> {
+        self.retained.iter().map(|(name, _)| name.clone()).collect()
+    }
+}
+
+/// Whether a custom section is worth keeping in memory.
+fn retain(name: &str) -> bool {
+    name == "name" || name.starts_with(".debug")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Stage 2 is built from `SourceMapper::new(&[])` in `main`, and Phase 3 will build it
-    /// from whatever the user pointed the profiler at — including a file that is not a
-    /// module at all. Construction must not be the thing that crashes the run.
-    #[test]
-    fn construction_tolerates_bytes_without_debug_info() {
-        let _empty = SourceMapper::new(&[]);
-        let _truncated_header = SourceMapper::new(b"\0asm\x01\x00\x00\x00");
-        let _not_wasm = SourceMapper::new(b"definitely not a wasm module");
+    /// Encode one LEB128 unsigned integer.
+    fn uleb(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            out.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                return out;
+            }
+        }
     }
 
-    /// The property aggregation relies on: an unattributable address is `None`, not a
-    /// frame. If Phase 3 makes construction fallible, these calls gain an `unwrap`.
+    /// Build a module carrying the given custom sections, so a test can describe a binary
+    /// exactly rather than depending on whatever a toolchain happened to emit.
+    fn module(custom: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+
+        for (name, payload) in custom {
+            let name_bytes = name.as_bytes();
+            let mut section = uleb(name_bytes.len() as u64);
+            section.extend_from_slice(name_bytes);
+            section.extend_from_slice(payload);
+
+            bytes.push(0); // custom section id
+            bytes.extend(uleb(section.len() as u64));
+            bytes.extend(section);
+        }
+
+        // One real code section, so the module is not nothing: `488` is the size of the fixture's.
+        bytes.push(10);
+        bytes.extend(uleb(2));
+        bytes.extend([0x01, 0x00]);
+        bytes
+    }
+
+    /// The fixture that carries DWARF, built by `fixtures/dwarf_probe/build.sh`.
+    const DWARF_PROBE: &[u8] = include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm");
+
     #[test]
-    fn an_unattributable_pc_yields_no_frame() {
-        let mapper = SourceMapper::new(&[]);
+    fn an_empty_input_is_not_a_module() {
+        // #150: the ask is that `&[]` fails with the expected error rather than panicking or
+        // silently yielding a mapper that resolves nothing.
+        let error = SourceMapper::new(&[]).err().expect("no bytes, no module");
+
+        assert_eq!(error, SourceMapError::NotWasm);
+        assert!(
+            error.to_string().contains("not a WebAssembly module"),
+            "the message has to tell the user what to pass instead: {error}"
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_wasm_are_rejected_by_magic() {
+        for input in [
+            b"definitely not a wasm module".as_slice(),
+            b"WAT!(module)".as_slice(),
+            b"\x7fELF\x02\x01\x01\x00".as_slice(),
+        ] {
+            assert_eq!(
+                SourceMapper::new(input).err(),
+                Some(SourceMapError::NotWasm),
+                "a `{}`-byte input is not a module",
+                input.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_without_debug_info_reports_the_build_flag_that_fixes_it() {
+        // The ordinary case for a release build, and the one a user can actually act on.
+        let stripped = module(&[("name", b"functions"), ("producers", b"CL 17")]);
+
+        let error = SourceMapper::new(&stripped)
+            .err()
+            .expect("a binary with no DWARF must not look like a successful load");
+
+        let message = error.to_string();
+        let SourceMapError::MissingDebugInfo { custom_sections } = &error else {
+            panic!("expected the missing-DWARF error, got {error:?}");
+        };
+        assert!(
+            message.contains("line-tables-only"),
+            "the message has to name the setting that emits debug info: {message}"
+        );
+        assert!(
+            message.contains(&custom_sections.join(", ")),
+            "listing what *is* there is how a user notices a `name` section to fall back to: \
+             {message}"
+        );
+    }
+
+    #[test]
+    fn truncated_section_headers_error_instead_of_reading_past_the_end() {
+        // A section claims more bytes than the file holds — a partial download, not a bad build.
+        let claims_too_much = [
+            b"\0asm\x01\0\0\0\x00\x7f".to_vec(),
+            b"\0asm\x01\0\0\0\x00\x04\x0b.debu".to_vec(),
+            b"\0asm\x01\0\0\0\x00\x05\x0b\x00.debug_info".to_vec(),
+        ];
+
+        for input in claims_too_much {
+            assert_eq!(
+                SourceMapper::new(&input).err(),
+                Some(SourceMapError::Truncated),
+                "input {:?} must be reported as truncated, not panicking",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+
+    #[test]
+    fn sections_this_stage_ignores_are_skipped_without_error() {
+        // Soroban emits `contractspecv0`/`contractmetav0` and LLVM `producers`/`target_features`;
+        // a module carrying those plus no DWARF is a normal binary, so the only complaint is the
+        // missing debug info — and the retained names show which sections were noticed.
+        let with_spec = module(&[
+            ("contractspecv0", b"\x01\x02\x03"),
+            (".debug_abbrev", b"\x01"),
+            ("target_features", b"\x00"),
+        ]);
+
+        let error = SourceMapper::new(&with_spec)
+            .err()
+            .expect("no .debug_info present");
+
+        match error {
+            SourceMapError::MissingDebugInfo { custom_sections } => assert_eq!(
+                custom_sections,
+                vec![".debug_abbrev".to_string()],
+                "only DWARF and `name` are worth keeping a copy of"
+            ),
+            other => panic!("expected the missing-DWARF error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_real_build_with_line_tables_loads() {
+        // The happy path against DWARF a toolchain actually emitted, not a fixture assembled by
+        // hand: this is the artifact `fixtures/dwarf_probe/build.sh` produces from Rust source.
+        let mapper = SourceMapper::new(DWARF_PROBE)
+            .unwrap_or_else(|error| panic!("the DWARF-bearing fixture should load: {error}"));
+
+        assert!(mapper.has_debug_info());
+
+        // Present is not the same as usable. Walking every compilation unit's line table is the
+        // check that the section bytes reached gimli whole: a mis-sliced custom section still
+        // loads, then fails here with an unexpected end of input.
+        let context = mapper.context.as_ref().expect("has_debug_info()");
+        context.parse_lines().unwrap_or_else(|error| {
+            panic!("the fixture's line tables should be readable: {error}")
+        });
+    }
+
+    #[test]
+    fn unreadable_dwarf_is_reported_rather_than_panicking() {
+        // Present-but-nonsense sections: `gimli` rejects them, and Phase 5's CLI needs that to be
+        // a message about rebuilding, not a crash in the middle of a profile run.
+        let garbage = module(&[
+            (".debug_info", b"not dwarf at all"),
+            (".debug_abbrev", b"also not dwarf"),
+            (".debug_line", b"nor this"),
+        ]);
+
+        let error = SourceMapper::new(&garbage)
+            .err()
+            .expect("malformed DWARF must not load as if it were fine");
+
+        let SourceMapError::UnreadableDwarf { ref reason } = error else {
+            panic!("expected the unreadable-DWARF error, got {error:?}");
+        };
+        assert!(
+            error.to_string().contains("rebuild"),
+            "the message has to point at a fix: {error}"
+        );
+        assert!(!reason.is_empty(), "and say what gimli objected to");
+    }
+
+    #[test]
+    fn an_unmapped_mapper_resolves_nothing_at_any_address() {
+        let mapper = SourceMapper::unmapped();
+
+        assert!(!mapper.has_debug_info());
         for pc in [0usize, 1, 64, 4096, usize::MAX] {
             assert!(
                 mapper.resolve(pc).is_none(),
-                "pc {pc} resolved to a frame from a binary that carries no DWARF"
+                "pc {pc} resolved to a frame from a mapper with no symbols"
             );
         }
+    }
+
+    #[test]
+    fn section_walk_survives_a_module_that_ends_on_a_boundary() {
+        // The loop must stop cleanly at the last section's end byte rather than reading one past.
+        let exact = module(&[(".debug_info", b"\x00")]);
+
+        assert_eq!(
+            WasmSections::parse(&exact).unwrap().get(".debug_info"),
+            Some(&[0u8][..])
+        );
     }
 }
