@@ -41,6 +41,23 @@
   why every event is recorded at `pc = 0`.
 
 ## Phase 3: DWARF Source Mapping
+- [x] **SPIKE: `name` section fallback & `wasm-opt` behavior (#141):** answered with measurements
+  in `docs/spikes/02_wasm_name_section_fallback.md`, and the answer is "no, not for deployed
+  artifacts". `rust-lld` emits a `name` section unconditionally — it is present in a
+  `debug = false` build (98 B, all three probe functions, 0 DWARF bytes) — and binaryen deletes it
+  unless `-g` is passed. `stellar contract optimize` never passes `-g` (its recipe is
+  `new_optimize_for_size_aggressively()` + `converge` + MVP features + MutableGlobals/SignExt/
+  BulkMemory, reproduced on `wasm-opt 133`), so the deployed `.wasm` has neither names nor usable
+  DWARF. Worse: its five `.debug_*` sections *survive* (493,883 of 495,198 bytes) and are stale,
+  so `SourceMapper::new` succeeds, `has_debug_info()` is `true`, and 0 of 270 probed code offsets
+  resolve — the degenerate mapping #162 has to warn about, now measured rather than hypothesized.
+  Adding `-g` restores both (1,765 B fixture, 140 of 145 offsets resolve, 139 with a line), which
+  makes the user-facing guidance "profile the pre-optimization artifact, or optimize with `-g`".
+  For #157 the section is readable with the walk we already do: kind `1` records are
+  `funcidx` + length + bytes, `funcidx` spans the whole function index space including the
+  contract's 4 imports (18 entries for 4 imports + 14 defined functions), and the names are
+  rustc-mangled v0 symbols, so `rustc-demangle` — already enabled for #142 — is mandatory.
+  Names are function-level only: no `file:line`, ever.
 - [x] **Add Dependencies (#142):** `addr2line 0.25.1` and `gimli 0.32.3` are both direct
   dependencies now, and neither is a new download — both were already in `Cargo.lock` via
   `backtrace`. `addr2line` builds with `default-features = false, features = ["std",
@@ -58,9 +75,10 @@
   just the contract's own functions. That is affordable for a profiling input and not something to
   deploy, which is why the fixture stays out of git (CI's `build-fixture` job builds it) and why
   `fixtures/dwarf_probe/` exists: the same three functions in a `#![no_std]` crate with
-  `panic = "abort"` and `debug = 1` are **1,675 bytes with real DWARF**, small enough to commit and
-  to `include_bytes!` from a unit test. Whether line tables survive
-  `stellar contract build`/`wasm-opt` is still the open Question in Phase 3 Issue 0 (#141).
+  `panic = "abort"` and `debug = 1` are **1,690 bytes with real DWARF**, small enough to commit and
+  to `include_bytes!` from a unit test. What survives `wasm-opt` and the `stellar` pipeline is
+  #141's question, answered at the top of this phase and in
+  `docs/spikes/02_wasm_name_section_fallback.md`.
 - [x] **Load DWARF Info (#143, #144, #149, #150):** `SourceMapper::new(&[u8])` now returns
   `Result<Self, SourceMapError>` and holds the built `addr2line::Context`; `unmapped()` is the
   explicit no-symbols path and `has_debug_info()` tells the two apart. The WASM section table is
@@ -73,7 +91,7 @@
   `name` fallback; unreadable DWARF is `UnreadableDwarf` carrying gimli's reason; neither is a
   panic. Covered by nine unit tests plus two doctests against both committed fixtures, and verified
   against the real 622 KB Soroban build.
-- [ ] **Address Resolution (#145–#148):** Implement the `resolve(pc)` function to translate a WASM Program Counter to a Rust `file:line` frame. Blocked upstream, not by DWARF: `wasmi` 2.0 gives a call hook no program counter and has no instruction hook, so every event the tracer records is at `pc = 0` — see the tracer's `invoke_function` docs and `only_the_outer_invocation_is_recorded_as_a_boundary`. Verified separately that DWARF line tables are code-section-relative (offsets `4`/`8`/`16`/`64` resolved to `src/lib.rs:2` and `:5`), so the missing piece is a real offset from the engine, plus Issue 22's offset translation once there is one. The DWARF half no longer is: `fixtures/dwarf_probe/dwarf_probe.wasm` carries line tables a test already loads, so these issues can be written against a committed artifact.
+- [ ] **Address Resolution (#145–#148):** Implement the `resolve(pc)` function to translate a WASM Program Counter to a Rust `file:line` frame. Blocked upstream, not by DWARF: `wasmi` 2.0 gives a call hook no program counter and has no instruction hook, so every event the tracer records is at `pc = 0` — see the tracer's `invoke_function` docs and `only_the_outer_invocation_is_recorded_as_a_boundary`. Verified separately that DWARF line tables are code-section-relative (offsets `4`/`8`/`16`/`64` resolved to `src/lib.rs:2` and `:5`), so the missing piece is a real offset from the engine, plus Issue 22's offset translation once there is one. The DWARF half no longer is: `fixtures/dwarf_probe/dwarf_probe.wasm` carries line tables a test already loads, so these issues can be written against a committed artifact. #141 measured that half directly — 160 of the 166 probed code-section offsets resolve, 133 of them to a line, over 4 demangled function names — so the mapper has a working input and only the offset is missing.
 
 ## Phase 4: Aggregation & Formatting
 - [x] **Tree Building:** Implement `ProfileAggregator` to consume the raw `TraceEvent` stream and build a `CallStackNode` tree (#52). Open frames live on a stack, so accounting allocates per call rather than per instruction (`AGENTS.md`'s OOM constraint); a frame that meets another of the same name pools into it, the way flamegraph consumers collapse repeated stack frames. Trapped runs keep their still-open frames and an unmatched `Return` is ignored, so a partial trace still renders.
