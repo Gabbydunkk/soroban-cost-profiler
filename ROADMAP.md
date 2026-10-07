@@ -41,18 +41,39 @@
   why every event is recorded at `pc = 0`.
 
 ## Phase 3: DWARF Source Mapping
-- [ ] **Add Dependencies:** Add `addr2line` and `gimli` for debug info parsing. Neither is a new
-  download: both are already in `Cargo.lock` at `addr2line 0.25.1` / `gimli 0.32.3` (pulled in by
-  `backtrace`), and `addr2line` with `default-features = false, features = ["std"]` builds without
-  `cpp_demangle` or `object`.
-- [ ] **Enable Debug Info for the Fixture:** A prerequisite found while documenting
-  `src/source_map.rs` (#50): `fixtures/build.sh` inherits the root `[profile.release]`, which sets
-  only `opt-level = "z"`, so `dummy_contract.wasm` ships with **no `.debug_*` section at all**. A
-  `debug = "line-tables-only"` (or `2`) profile setting for the fixture is required before any
-  test can assert a `file:line`. Whether it survives `stellar contract build`/`wasm-opt` is the
-  open Question in Phase 3 Issue 0.
-- [ ] **Load DWARF Info:** Parse the `.debug_info` and `.debug_line` sections of the loaded WASM binary in `src/source_map.rs`. Verified against a real build: Rust emits DWARF as *individual* WASM custom sections (`.debug_abbrev`, `.debug_info`, `.debug_str`, `.debug_line`, `.debug_loc`, `.debug_ranges`), and `addr2line::Context::from_sections` accepts their raw bytes, so this is a section scan with no hand-written DWARF parsing — which is what keeps `AGENTS.md`'s "no custom `gimli` parsers" rule satisfiable.
-- [ ] **Address Resolution:** Implement the `resolve(pc)` function to translate a WASM Program Counter to a Rust `file:line` frame. Blocked upstream, not by DWARF: `wasmi` 2.0 gives a call hook no program counter and has no instruction hook, so every event the tracer records is at `pc = 0` — see the tracer's `invoke_function` docs and `only_the_outer_invocation_is_recorded_as_a_boundary`. Verified separately that DWARF line tables are code-section-relative (offsets `4`/`8`/`16`/`64` resolved to `src/lib.rs:2` and `:5`), so the missing piece is a real offset from the engine, plus Issue 22's offset translation once there is one.
+- [x] **Add Dependencies (#142):** `addr2line 0.25.1` and `gimli 0.32.3` are both direct
+  dependencies now, and neither is a new download — both were already in `Cargo.lock` via
+  `backtrace`. `addr2line` builds with `default-features = false, features = ["std",
+  "rustc-demangle"]`, which keeps `cpp_demangle`, `object` and `memmap2` out of the tree.
+  `gimli` has to be named on its own rather than reached through `addr2line::gimli`: addr2line's
+  `endian-reader` is what provides `EndianRcSlice` — the owned reader a mapper that outlives the
+  caller's buffer needs. The footprint is two small pure-Rust crates entering `Cargo.lock`
+  (`stable_deref_trait`, for `Rc<[u8]>: CloneStableDeref`, and `fallible-iterator`); `std` is not
+  optional, since without it `EndianRcSlice` does not implement `gimli::Reader` at all.
+- [x] **Enable Debug Info for the Fixture (#143 prerequisite):** the root manifest gained
+  `[profile.release.package.dummy-contract] debug = "line-tables-only"`, so `fixtures/build.sh`
+  now emits `.debug_abbrev`, `.debug_info`, `.debug_line`, `.debug_ranges` and `.debug_str`.
+  Measured on the current toolchain: the artifact goes from 3.1 KB to **622,507 bytes**, of which
+  ~619 KB are those five sections — a `std`-linked build symbolizes every inlined dependency, not
+  just the contract's own functions. That is affordable for a profiling input and not something to
+  deploy, which is why the fixture stays out of git (CI's `build-fixture` job builds it) and why
+  `fixtures/dwarf_probe/` exists: the same three functions in a `#![no_std]` crate with
+  `panic = "abort"` and `debug = 1` are **1,675 bytes with real DWARF**, small enough to commit and
+  to `include_bytes!` from a unit test. Whether line tables survive
+  `stellar contract build`/`wasm-opt` is still the open Question in Phase 3 Issue 0 (#141).
+- [x] **Load DWARF Info (#143, #144, #149, #150):** `SourceMapper::new(&[u8])` now returns
+  `Result<Self, SourceMapError>` and holds the built `addr2line::Context`; `unmapped()` is the
+  explicit no-symbols path and `has_debug_info()` tells the two apart. The WASM section table is
+  walked by hand — section id, payload length, custom-section name — and nothing below that is
+  hand-written: the retained bytes go to `gimli::Dwarf::load` and `addr2line::Context::from_dwarf`,
+  which is what keeps `AGENTS.md`'s "no custom DWARF parsing" rule satisfiable. Only `name` and
+  `.debug_*` are copied out; `producers`, `target_features` and Soroban's `contractspecv0` are
+  skipped. Missing `.debug_info` is `MissingDebugInfo`, whose message names
+  `debug = "line-tables-only"` and lists the sections that *were* present so a user can see the
+  `name` fallback; unreadable DWARF is `UnreadableDwarf` carrying gimli's reason; neither is a
+  panic. Covered by nine unit tests plus two doctests against both committed fixtures, and verified
+  against the real 622 KB Soroban build.
+- [ ] **Address Resolution (#145–#148):** Implement the `resolve(pc)` function to translate a WASM Program Counter to a Rust `file:line` frame. Blocked upstream, not by DWARF: `wasmi` 2.0 gives a call hook no program counter and has no instruction hook, so every event the tracer records is at `pc = 0` — see the tracer's `invoke_function` docs and `only_the_outer_invocation_is_recorded_as_a_boundary`. Verified separately that DWARF line tables are code-section-relative (offsets `4`/`8`/`16`/`64` resolved to `src/lib.rs:2` and `:5`), so the missing piece is a real offset from the engine, plus Issue 22's offset translation once there is one. The DWARF half no longer is: `fixtures/dwarf_probe/dwarf_probe.wasm` carries line tables a test already loads, so these issues can be written against a committed artifact.
 
 ## Phase 4: Aggregation & Formatting
 - [x] **Tree Building:** Implement `ProfileAggregator` to consume the raw `TraceEvent` stream and build a `CallStackNode` tree (#52). Open frames live on a stack, so accounting allocates per call rather than per instruction (`AGENTS.md`'s OOM constraint); a frame that meets another of the same name pools into it, the way flamegraph consumers collapse repeated stack frames. Trapped runs keep their still-open frames and an unmatched `Return` is ignored, so a partial trace still renders.
