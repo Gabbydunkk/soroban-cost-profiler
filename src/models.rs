@@ -36,6 +36,10 @@ pub struct TraceEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFrame {
+    /// What ran, as `addr2line` demangled it with rustc's anonymous closure segments rewritten to
+    /// `[closure]`/`[closure#N]` (see `source_map::collapse_closures`). This is the key
+    /// `CallStackNode::children` pools frames by, so two names that differ only in `{closure}`
+    /// noise would split one function's cost across two frames.
     pub function_name: String,
     pub file_path: Option<String>,
     pub line_number: Option<u32>,

@@ -146,6 +146,36 @@ inlined dependencies. All three fixture contract functions are `#[no_mangle] ext
 makes a bare `_R` prefix reaching a frame a real bug rather than an expected shape, and there is a test
 sweeping the whole fixture code section for exactly that.
 
+### What demangling leaves: closure segments
+
+Demangling does not make a name anonymous-free. rustc gives a closure no path segment of its own and
+writes one of these instead, both measured from a probe crate whose `outer` function holds a closure
+that holds a closure:
+
+```
+closure_probe::outer::{closure#0}       debug = 2, opt-level = 1 — each closure gets its own function
+closure_probe::outer::{closure_env#0}   line-tables-only, opt-level = 3 — the body was inlined away
+                                        and only the environment type survives, inside the generic
+                                        arguments of whatever takes it
+```
+
+`collapse_closures` rewrites each one to `[closure]`, or `[closure#N]` where the segment carries an
+index, and drops a segment whose entire separator since the previous one is `::`: a run of nested
+closures is one frame in a flamegraph, not a stack of markers. The index survives on a closure that
+is not part of a run, because two sibling closures in one function are different work and
+`CallStackNode`'s children are keyed by name — flattening both to `[closure]` would pool them into a
+single frame and lose which one spent the fuel.
+
+`{{closure}}`, the spelling #155 names, is legacy mangling. v0 encodes a closure structurally
+(`…13closure_probe5outer0E…` in the same crate's `name` section, the trailing digit being the
+disambiguator), so `rustc-demangle` renders a modern closure as `{closure#N}` and neither probe build
+contains a single `{{closure}}` byte. It is handled anyway: trimming one more brace level costs no
+branch, and a pre-2020 artifact will hand exactly that form to #157's `name`-section path.
+
+`{impl#0}` — an anonymous impl block — is the same species of noise and deliberately untouched. It is
+not a closure, and the rewrite preserves every byte outside a closure segment, generic arguments
+included.
+
 ## The `name` section is a different animal
 
 `name` is a wasm custom section that maps function-index-space indices to symbol names. It is present
