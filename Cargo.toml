@@ -17,9 +17,31 @@ edition = "2024"
 soroban-env-host = "28.0.2"
 tracing = "0.1.44"
 wasmi = "2.0.0"
+# Phase 3, #142. Both were already resolved in Cargo.lock at these versions by `backtrace`, so
+# this changes no existing version; the lock gains two small pure-Rust crates that gimli's
+# features need (`stable_deref_trait`, `fallible-iterator`) and nothing else.
+# `default-features = false` is what keeps `cpp_demangle`, `object` and `memmap2` out: the WASM
+# custom sections are read as raw bytes and handed to `addr2line::Context::from_dwarf`, and C++
+# demangling is not a case this pipeline will ever see. `std` is not optional in practice —
+# `EndianRcSlice` requires `Rc<[u8]>: CloneStableDeref`, which `stable_deref_trait` only
+# implements with its own `std` feature on.
+addr2line = { version = "0.25.1", default-features = false, features = ["rustc-demangle", "std"] }
+# `gimli` has to be a direct dependency, not reached through `addr2line::gimli`: addr2line's own
+# dependency is `features = ["read"]`, which excludes `endian-reader`, and `endian-reader` is what
+# provides the owned `EndianRcSlice` a mapper that outlives the caller's buffer needs. Naming it
+# here is also the honest dependency — the section loading in `src/source_map.rs` is gimli's code,
+# not a hand-written DWARF parser, which is what `AGENTS.md` requires.
+gimli = { version = "0.32.3", default-features = false, features = ["read", "endian-reader", "std"] }
 
 [profile.release]
 opt-level = "z"
+
+# Phase 3 prerequisite, found while documenting `src/source_map.rs`: release builds strip debug
+# info, so `dummy_contract.wasm` shipped no `.debug_*` section at all and no test could assert a
+# `file:line`. Line tables are what source mapping needs and cost far less than full `-g`.
+# Per-package only, so the profiler binary's own release build is unchanged.
+[profile.release.package.dummy-contract]
+debug = "line-tables-only"
 
 [dev-dependencies]
 criterion = "0.8.2"

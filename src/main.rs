@@ -26,6 +26,7 @@ use soroban_cost_profiler::aggregator::ProfileAggregator;
 use soroban_cost_profiler::formatter::OutputFormatter;
 use soroban_cost_profiler::source_map::SourceMapper;
 use soroban_cost_profiler::tracer::ExecutionTracer;
+use tracing::warn;
 
 /// Stage 1: build a tracer carrying the MVP sampling and instruction-ceiling defaults.
 ///
@@ -37,10 +38,18 @@ fn initialize_tracer() -> ExecutionTracer {
 
 /// Stage 2: build the source mapper for the target WASM binary.
 ///
-/// Empty bytes are a placeholder until the binary is read from disk, so `resolve()` has
-/// nothing to map and returns `None`. Phase 3 replaces this with `load_wasm_file` output.
+/// Loading is fallible now that the stage reads DWARF, and the failure is not fatal: a binary
+/// without symbols still profiles, it just names frames `wasm[pc]`. The error is logged because
+/// it tells the user which build flag to set — a flamegraph of unnamed frames is otherwise
+/// indistinguishable from a profiler that is not working.
+///
+/// Empty bytes are the placeholder until Phase 5 reads the binary from disk (`load_wasm_file`),
+/// so this logs `NotWasm` and continues with an unmapped mapper.
 fn load_source_mapper() -> SourceMapper {
-    SourceMapper::new(&[])
+    SourceMapper::new(&[]).unwrap_or_else(|error| {
+        warn!("cannot symbolize frames: {error}");
+        SourceMapper::unmapped()
+    })
 }
 
 /// Stage 3: build an empty aggregator.
