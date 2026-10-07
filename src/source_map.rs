@@ -146,7 +146,8 @@ impl std::error::Error for SourceMapError {}
 /// Two traps the resolution issues will hit, both seen in the probe that produced the numbers
 /// above:
 ///
-/// * A location can carry a file and *no* line: address `32` came back as
+/// * A location can carry a file and *no* line: 26 addresses of the committed fixture's code
+///   section (`61`–`71` and `75`–`89`, inside `memory_heavy_loop`) resolve to
 ///   `file: Some(".../src/lib.rs"), line: None`. `SourceFrame`'s `Option` location fields are
 ///   independent for exactly this reason, so fill them separately instead of treating a
 ///   missing line as line 0 or as a failed lookup.
@@ -156,6 +157,9 @@ impl std::error::Error for SourceMapError {}
 ///   `/rustc/<hash>/library/compiler-builtins/.../../../../libm/src/math/...`. So anything
 ///   that groups or shortens frames by file must expect std/registry paths next to contract
 ///   paths, and a report is only readable next to the build that produced it.
+///
+/// The long form of this material — the measured address table, the inline-stack semantics, and
+/// how to produce a binary that maps at all — is `docs/internals/dwarf_mapping.md`.
 ///
 /// [`ProfileAggregator::aggregate`]: crate::aggregator::ProfileAggregator::aggregate
 /// [`invoke_function`]: crate::tracer::invoke_function
