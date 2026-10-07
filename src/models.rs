@@ -23,7 +23,12 @@ pub enum EventType {
 /// was emitted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceEvent {
-    pub pc: usize, // WASM Program Counter (Instruction Pointer)
+    /// Where in the wasm this event happened, in the address space `addr2line` indexes: an offset
+    /// into the code section's payload, where address `0` is the function-count byte. Not a file
+    /// offset and not a linear-memory address — [`crate::source_map::CodeMap`] translates those.
+    /// `wasmi` 2.0 gives its call hook no instruction pointer, so every event the tracer records is
+    /// `0`, which is a real address that belongs to no instruction.
+    pub pc: usize,
     pub event_type: EventType,
     pub cpu_cost: u64, // CPU cost consumed since last event
     pub mem_cost: u64, // Memory allocated since last event

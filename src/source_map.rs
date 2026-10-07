@@ -1,5 +1,6 @@
 use crate::models::SourceFrame;
 use addr2line::FunctionName;
+use std::ops::Range;
 use std::rc::Rc;
 
 /// The reader type `addr2line` is instantiated with.
@@ -107,7 +108,8 @@ impl std::error::Error for SourceMapError {}
 ///   individual custom sections, alongside `name`, `producers`, `target_features` and
 ///   Soroban's `contractspecv0`. They are not merged into one `DWARF` section, so
 ///   `ROADMAP.md`'s "parse the `.debug_info` and `.debug_line` sections" is literally right,
-///   and the only hand-written parsing here is the WASM section table — never DWARF itself.
+///   and the only hand-written parsing here is the WASM container — the section table, plus the
+///   code section's function framing [`CodeMap`] needs — never DWARF itself.
 ///   `AGENTS.md`'s "no custom DWARF parsing" rule holds: `gimli::Dwarf::load` reads the
 ///   sections, `addr2line::Context::from_dwarf` builds the index.
 /// * **`addr2line` needs no file wrapper and adds no dependency weight.** Its
@@ -129,15 +131,19 @@ impl std::error::Error for SourceMapError {}
 ///   Soroban build, and it is why `fixtures/build.sh`'s output is a *profiling input*, never
 ///   something to deploy. A `#![no_std]` crate with `panic = "abort"` shows the floor: the
 ///   same three functions cost 1.7 KB total.
-/// * **DWARF addresses are code-section-relative, and `wasmi` never hands us one.** Looking up
-///   `4`, `8` and `16` in that build returned `src/lib.rs:2` (the function's signature) and
-///   `64` returned `src/lib.rs:5` (its loop body) — offsets into the code section, matching
-///   #153's translation note. [`SourceMapper::resolve`] now turns such an offset into a frame:
-///   sweeping the committed fixture's code section resolves 160 of its 166 addresses, 133 of them
-///   to a line. What is still missing is an address worth resolving, because `wasmi` 2.0 gives a
-///   call hook no program counter and offers no instruction hook at all, so every event
-///   `invoke_function` records is written at `pc = 0`. See [`invoke_function`] for what the hooks
-///   can and cannot see.
+/// * **DWARF addresses are offsets into the code section payload, and [`CodeMap`] is what puts a
+///   value into that space.** The base is measured rather than assumed: address `0` is the code
+///   section's function-count byte, so a file offset translates by subtracting the payload's start.
+///   In `fixtures/dwarf_probe/dwarf_probe.wasm` that start is file offset `111`, and the three
+///   function bodies land on `2..16`, `18..157` and `158..165` — precisely where `resolve` begins
+///   answering, which is the check that pins the base. Sweeping that code section resolves 160 of
+///   its 166 addresses, 133 of them to a line. What is still missing is an address worth
+///   resolving: `wasmi` 2.0's only execution hook is `Store::call_hook`, whose closure receives a
+///   `CallHook` *variant* and nothing else — no callee, no instruction hook, no program counter —
+///   and because the engine re-encodes wasm bytecode into its own instruction stream and discards
+///   the original offsets as it goes, a runtime position would not map back even if one were
+///   exposed. So every event [`invoke_function`] records is written at `pc = 0`, and the finest
+///   attribution the engine can be given is one function body.
 /// * **The `name` section survives this build path**, so a function-name-only fallback is real
 ///   (#157); a plain `cargo build` does not strip it, while
 ///   `stellar contract build` does. That is the precedence the docs should describe: DWARF ->
@@ -168,6 +174,10 @@ impl std::error::Error for SourceMapError {}
 /// [`SourceMapper::resolve`]: SourceMapper::resolve
 pub struct SourceMapper {
     context: Option<Context>,
+    /// Where this binary's code section is, so file offsets can be moved into the address space
+    /// `context` indexes. `None` when the module has no code section or its function list does not
+    /// match its declared size — DWARF resolution does not need it, so it is not an error.
+    code: Option<CodeMap>,
 }
 
 impl SourceMapper {
@@ -226,6 +236,7 @@ impl SourceMapper {
 
         Ok(Self {
             context: Some(context),
+            code: sections.code,
         })
     }
 
@@ -236,7 +247,10 @@ impl SourceMapper {
     /// has no binary to read yet — Phase 5's CLI replaces it with [`SourceMapper::new`] plus the
     /// warning the returned error carries.
     pub fn unmapped() -> Self {
-        Self { context: None }
+        Self {
+            context: None,
+            code: None,
+        }
     }
 
     /// Whether this mapper has DWARF to resolve against.
@@ -310,7 +324,169 @@ impl SourceMapper {
             line_number: location.and_then(|loc| loc.line),
         })
     }
+
+    /// Where this binary's code section is, for translating a position in the file.
+    ///
+    /// `None` when the module carries no code section or its declared function list runs past the
+    /// section's bytes. That is deliberately not a [`SourceMapError`]: a caller with a DWARF address
+    /// already in hand needs no translation, and failing a whole profiling run over an address map
+    /// nothing asked for would be the wrong trade.
+    pub fn code_map(&self) -> Option<&CodeMap> {
+        self.code.as_ref()
+    }
+
+    /// Resolve a byte offset *in the file* to the source frame that produced it.
+    ///
+    /// The same lookup as [`SourceMapper::resolve`], one address space earlier: the offset is moved
+    /// into code-section-relative form by [`CodeMap::to_code_address`] before DWARF is asked, which
+    /// is the step #153 exists because the two spaces are not the same and passing one for the other
+    /// resolves nothing without saying so.
+    ///
+    /// Use this for anything that reads the binary — a section walk, a `wasm-objdump` figure, a
+    /// hand-checked offset. Use [`SourceMapper::resolve`] for anything already in DWARF's space.
+    ///
+    /// Returns `None` if this mapper has no [`CodeMap`], if the offset is outside the code section,
+    /// or if the translated address resolves to no frame.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use soroban_cost_profiler::source_map::SourceMapper;
+    ///
+    /// let fixture = include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm");
+    /// let mapper = SourceMapper::new(fixture).expect("the fixture carries DWARF");
+    ///
+    /// // In this fixture the code section's payload begins at file offset 111, and the first
+    /// // function's body two bytes later: the count byte and its size prefix are addresses too,
+    /// // they simply precede the line program.
+    /// let map = mapper.code_map().expect("the fixture has a code section");
+    /// assert_eq!(map.to_code_address(111), Some(0));
+    /// assert_eq!(map.to_code_address(110), None, "before the section is not in it");
+    ///
+    /// let frame = mapper
+    ///     .resolve_file_offset(114)
+    ///     .expect("file offset 114 is code address 3");
+    /// assert_eq!(frame.function_name, "caller_of_heavy");
+    /// assert_eq!(frame.line_number, Some(39));
+    /// ```
+    pub fn resolve_file_offset(&self, file_offset: usize) -> Option<SourceFrame> {
+        let address = self.code.as_ref()?.to_code_address(file_offset)?;
+        self.resolve(address)
+    }
 }
+
+/// The code section's address map: what an offset in the file means to DWARF.
+///
+/// `addr2line`'s line tables for a wasm build are written against offsets into the code section's
+/// **payload** — the bytes after the section id and length — so address `0` is the function-count
+/// byte, not the first instruction. That makes the relationship between the two spaces a constant
+/// the module itself carries, and this type holds it: [`Self::to_code_address`] subtracts the
+/// payload's start, [`Self::bodies`] gives where each function begins, and the two agree only if the
+/// base is exactly right, which is how the rule was pinned against the committed fixtures rather
+/// than copied from a spec reading.
+///
+/// Built by walking the section table and the code section's function framing — wasm container bytes
+/// again, never DWARF — and best effort: an unreadable code section yields no map from
+/// [`SourceMapper::code_map`] instead of an error, because resolving a DWARF address does not need
+/// one.
+///
+/// # Examples
+///
+/// ```
+/// use soroban_cost_profiler::source_map::SourceMapper;
+///
+/// let fixture = include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm");
+/// let mapper = SourceMapper::new(fixture).expect("the fixture carries DWARF");
+/// let map = mapper.code_map().expect("the fixture has a code section");
+///
+/// // Three functions, and every body begins where the line tables begin to answer.
+/// let bodies = map.bodies();
+/// assert_eq!(bodies.len(), 3);
+/// assert_eq!(bodies[0], 2..16);
+/// assert_eq!(map.function_at(2), Some(0));
+/// assert_eq!(map.function_at(0), None, "the count byte belongs to no function body");
+/// for (index, body) in bodies.iter().enumerate() {
+///     let frame = mapper.resolve(body.start).expect("a body's first byte is its prologue");
+///     assert_eq!(map.function_at(body.start), Some(index), "{frame:?}");
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeMap {
+    /// File offset of the code section payload, which is DWARF address `0`.
+    base: usize,
+    /// Payload length, so an offset past the last function is rejected rather than translated.
+    len: usize,
+    /// `start..end` of each defined function's body, relative to [`Self::base`], in code-section
+    /// order. The code section lists only *defined* functions, so these are positions in that list —
+    /// turning one into a module function index needs the import count, which #157's `name`-section
+    /// work adds.
+    bodies: Vec<Range<usize>>,
+}
+
+impl CodeMap {
+    /// Read a code section payload, given where it starts in the file.
+    ///
+    /// `None` if the declared function list runs past the payload, which is a malformed or truncated
+    /// module rather than a file worth profiling. Iteration is bounded by the bytes rather than by
+    /// the declared count, so a count field that claims millions cannot allocate a table for them —
+    /// `AGENTS.md`'s OOM rule applies to the whole binary, not only the trace.
+    fn parse(payload: &[u8], base: usize) -> Option<Self> {
+        let mut cursor = 0;
+        let count = WasmSections::read_uleb(payload, &mut cursor).ok()?;
+        let mut bodies = Vec::new();
+
+        for _ in 0..count {
+            let size = usize::try_from(WasmSections::read_uleb(payload, &mut cursor).ok()?).ok()?;
+            let start = cursor;
+            let end = start.checked_add(size)?;
+            if end > payload.len() {
+                return None;
+            }
+            bodies.push(start..end);
+            cursor = end;
+        }
+
+        Some(Self {
+            base,
+            len: payload.len(),
+            bodies,
+        })
+    }
+
+    /// Move a byte offset in the file into the address space `addr2line` indexes.
+    ///
+    /// `None` when the offset is outside the code section — including the bytes before it, which a
+    /// naive subtraction would turn into a huge address that resolves to nothing.
+    pub fn to_code_address(&self, file_offset: usize) -> Option<usize> {
+        let address = file_offset.checked_sub(self.base)?;
+        (address < self.len).then_some(address)
+    }
+
+    /// The body range of each defined function, in code-relative addresses.
+    pub fn bodies(&self) -> &[Range<usize>] {
+        &self.bodies
+    }
+
+    /// Which defined function's body contains this code-relative address.
+    ///
+    /// `None` for the gaps every code section has: the count byte, the per-function size prefixes,
+    /// and one past the end. Those are real addresses that belong to no instruction, which is why
+    /// they resolve to no frame and why #162's "everything is unmapped" check has to tell the two
+    /// cases apart.
+    pub fn function_at(&self, address: usize) -> Option<usize> {
+        let index = self
+            .bodies
+            .partition_point(|body| body.start <= address)
+            .checked_sub(1)?;
+        self.bodies[index].contains(&address).then_some(index)
+    }
+}
+
+/// The section whose bytes define the address space DWARF line tables are written against.
+///
+/// Section id `10` in the WASM binary spec's ordering — the code section, one size-prefixed body
+/// per defined function, in the order the function section lists them.
+const CODE_SECTION: u64 = 10;
 
 /// The section whose absence means the binary cannot be source-mapped at all.
 ///
@@ -346,6 +522,10 @@ struct WasmSections {
     /// mapping and `name` for the function-name-only fallback. Everything else — `producers`,
     /// `target_features`, Soroban's `contractspecv0` — would be a copy of bytes nothing reads.
     retained: Vec<(String, Vec<u8>)>,
+    /// The code section's address map, from the same walk, for #153's translation. `None` when the
+    /// module has no code section or its function list does not fit its declared size; only the
+    /// section's *location* is kept, never its bytes, so this costs a `Vec` of ranges and no copy.
+    code: Option<CodeMap>,
 }
 
 impl WasmSections {
@@ -363,6 +543,7 @@ impl WasmSections {
 
         let mut cursor = 8; // past magic and version
         let mut retained = Vec::new();
+        let mut code = None;
 
         while cursor < bytes.len() {
             let id = Self::read_uleb(bytes, &mut cursor)?;
@@ -394,10 +575,16 @@ impl WasmSections {
                 }
             }
 
+            // Section id 10 is the code section, whose payload starts the address space DWARF
+            // indexes. Only the first counts; a module with two is not a module worth mapping.
+            if code.is_none() && id == CODE_SECTION {
+                code = CodeMap::parse(&bytes[cursor..end], cursor);
+            }
+
             cursor = end;
         }
 
-        Ok(Self { retained })
+        Ok(Self { retained, code })
     }
 
     /// Read a LEB128 unsigned integer, advancing the cursor.
@@ -494,10 +681,22 @@ mod tests {
             bytes.extend(section);
         }
 
-        // One real code section, so the module is not nothing: `488` is the size of the fixture's.
+        // A code section, so the module is not nothing: a function count of one and a body of zero
+        // bytes. Real bodies come from `fixtures/dwarf_probe`, never from here.
         bytes.push(10);
         bytes.extend(uleb(2));
         bytes.extend([0x01, 0x00]);
+        bytes
+    }
+
+    /// Build a module whose code section payload is exactly `payload`, so a test can describe a
+    /// malformed function list instead of trusting a toolchain to emit one.
+    fn module_with_code(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+
+        bytes.push(10);
+        bytes.extend(uleb(payload.len() as u64));
+        bytes.extend_from_slice(payload);
         bytes
     }
 
@@ -804,5 +1003,123 @@ mod tests {
             WasmSections::parse(&exact).unwrap().get(".debug_info"),
             Some(&[0u8][..])
         );
+    }
+
+    #[test]
+    fn address_zero_is_the_code_sections_function_count_byte() {
+        // The base #153 translates against, pinned to the fixture's own bytes: its code section
+        // payload runs from file offset 111 to 276, so those two are the boundary cases — the
+        // offset before the payload must fail rather than wrap into a huge address, and one past
+        // the end must fail rather than look like an unattributed line.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+        let map = mapper.code_map().expect("the fixture has a code section");
+
+        assert_eq!(map.to_code_address(111), Some(0));
+        assert_eq!(map.to_code_address(275), Some(164));
+        assert_eq!(map.to_code_address(276), None);
+        assert_eq!(map.to_code_address(110), None);
+        assert_eq!(map.to_code_address(0), None);
+        assert_eq!(map.to_code_address(usize::MAX), None);
+    }
+
+    #[test]
+    fn every_function_body_starts_where_dwarf_starts_answering() {
+        // The strongest check available on a committed binary, and the one that cannot pass by
+        // being self-consistent: `bodies` comes from the wasm framing and `resolve` comes from
+        // DWARF, so they agree only if the translation base is exactly right. Move the base by one
+        // byte and these addresses land on a size prefix or outside the section, and `resolve`
+        // answers `None` for all three.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+        let map = mapper.code_map().expect("the fixture has a code section");
+        let base = 111; // the fixture's code section payload, measured from its section table
+
+        assert_eq!(map.bodies(), &[2..16, 18..157, 158..165]);
+
+        let names = ["caller_of_heavy", "memory_heavy_loop", "compute_heavy_loop"];
+        for (index, body) in map.bodies().iter().enumerate() {
+            let frame = mapper
+                .resolve_file_offset(base + body.start)
+                .unwrap_or_else(|| panic!("offset {} is a function prologue", base + body.start));
+            assert_eq!(frame.function_name, names[index]);
+            assert_eq!(map.function_at(body.start), Some(index));
+        }
+    }
+
+    #[test]
+    fn the_gaps_between_bodies_are_addresses_but_not_instructions() {
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+        let map = mapper.code_map().expect("the fixture has a code section");
+
+        // The count byte, both size prefixes of the 139-byte second body, and everything from the
+        // last `end` opcode onward. These are valid addresses that belong to no function, which is
+        // why "resolved nothing" and "was never an instruction" have to stay separate answers.
+        for gap in [0usize, 1, 16, 17, 165, 166, usize::MAX] {
+            assert_eq!(map.function_at(gap), None, "address {gap} is a gap");
+        }
+
+        for (address, index) in [
+            (2, 0),
+            (15, 0),
+            (18, 1),
+            (75, 1),
+            (156, 1),
+            (158, 2),
+            (164, 2),
+        ] {
+            assert_eq!(map.function_at(address), Some(index), "address {address}");
+        }
+    }
+
+    #[test]
+    fn an_offset_outside_the_code_section_is_not_an_unattributed_line() {
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        // Header, another section's bytes, and past EOF. A file offset that is not in the code
+        // section is a caller's mistake, and reporting it as "this line has no frame" would send
+        // someone debugging the line table instead of their arithmetic.
+        for offset in [0usize, 8, 10, 110, 276, 279, 1_000, 1_000_000, usize::MAX] {
+            assert!(
+                mapper.resolve_file_offset(offset).is_none(),
+                "file offset {offset} is outside the code section"
+            );
+        }
+
+        // And the boundary the other way: the first offset inside it does resolve.
+        assert!(mapper.resolve_file_offset(113).is_some());
+    }
+
+    #[test]
+    fn a_code_section_that_overruns_its_bytes_leaves_the_module_loadable() {
+        // Count says three functions, the payload holds one. The section table is intact, so this
+        // is not `SourceMapError::Truncated`, and DWARF resolution must not be lost over an address
+        // map nothing asked for.
+        let payload = [uleb(3), uleb(1), vec![0x00]].concat();
+        let sections = WasmSections::parse(&module_with_code(&payload))
+            .expect("the section table itself is well formed");
+
+        assert_eq!(
+            sections.code, None,
+            "the function list runs past the section"
+        );
+    }
+
+    #[test]
+    fn an_absurd_function_count_never_becomes_a_capacity() {
+        // A 12-byte module declaring 2^64-1 functions must not allocate for them: the walk is
+        // bounded by the bytes, not the count. `AGENTS.md`'s OOM rule is about the trace, and the
+        // same habit applies to reading a binary.
+        let payload = [uleb(u64::MAX), uleb(1), vec![0x00]].concat();
+
+        assert_eq!(CodeMap::parse(&payload, 0), None);
+    }
+
+    #[test]
+    fn an_unmapped_mapper_has_no_addresses_to_translate() {
+        // The degraded path keeps working: no binary, so no code section, so no translation — and
+        // no panic in the caller that asked anyway.
+        let mapper = SourceMapper::unmapped();
+
+        assert!(mapper.code_map().is_none());
+        assert!(mapper.resolve_file_offset(113).is_none());
     }
 }

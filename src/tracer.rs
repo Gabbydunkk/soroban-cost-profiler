@@ -303,16 +303,21 @@ pub fn instantiate_module(
 ///   why [`ProfileAggregator::aggregate`] cannot be written against these events alone.
 ///   `only_the_outer_invocation_is_recorded_as_a_boundary` in `tests/meter_probe.rs` pins
 ///   this, and says what to change rather than delete when a per-call hook exists.
-/// * Every event is recorded at `pc = 0`. A call hook is given no program counter, so the
-///   cost of a whole call lands on its single boundary and cannot be attributed to a source
-///   line until the engine hands the tracer an offset — see [`SourceMapper`] for what real
-///   PCs would unlock, and why DWARF alone is not enough.
+/// * Every event is recorded at `pc = 0`. A call hook is given no program counter — `wasmi` 2.0's
+///   only execution hook passes the hook *variant* and nothing else, no callee and no offset — so the
+///   cost of a whole call lands on its single boundary. Even an internal instruction pointer would
+///   not help: the engine re-encodes wasm bytecode into its own instruction stream during
+///   translation and keeps no table back to the original offsets, so the finest address a tracer
+///   could ever be handed is a function body's start. That is the space [`CodeMap`] indexes, and
+///   #153 is the translation into it; see [`SourceMapper`] for what real offsets would unlock, and
+///   why DWARF alone is not enough.
 /// * One synthetic step of cost 1 is recorded per boundary rather than per instruction,
 ///   because there is no instruction-level hook. CPU cost therefore under-reports work done
 ///   inside a function body; the host-budget deltas in [`record_host_return`] are the
 ///   accurate part.
 ///
 /// [`ProfileAggregator::aggregate`]: crate::aggregator::ProfileAggregator::aggregate
+/// [`CodeMap`]: crate::source_map::CodeMap
 /// [`SourceMapper`]: crate::source_map::SourceMapper
 /// [`record_host_return`]: ExecutionTracer::record_host_return
 #[tracing::instrument(skip(store, instance, params, results))]

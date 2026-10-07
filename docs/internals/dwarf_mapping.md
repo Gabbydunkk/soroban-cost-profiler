@@ -41,19 +41,43 @@ from and keep serving lookups for a whole trace.
 
 ## The address space, which is the part that bites
 
-DWARF line tables in a wasm build are written against **offsets into the code section**, starting at
-zero. They are not linear-memory addresses, not file offsets, and not the `pc` any engine reports.
+DWARF line tables in a wasm build are written against **offsets into the code section's payload**:
+the bytes after the section id and its length, so address `0` is the function-count byte and each
+function's body begins one byte-size-prefix after its own size LEB. They are not linear-memory
+addresses, not file offsets, and not the `pc` any engine reports.
 
-`wasmi` 2.0 gives a call hook no program counter at all and offers no instruction hook, so today
-every event the tracer records carries `pc = 0` (see
-`docs/internals/tracer_architecture.md` and `ExecutionTracer::invoke_function`'s docs). That is why
-the mapper is fully implemented and tested while a profiled run still produces one unresolved frame:
-the missing half is #153, translating a real engine offset into code-section-relative form. Two
-consequences to keep in mind when you touch this:
+The base is measured, not assumed. In `fixtures/dwarf_probe/dwarf_probe.wasm` the code section's
+payload starts at file offset `111`, and framing its three functions gives bodies at code-relative
+`2..16`, `18..157` and `158..165` — which is exactly where `resolve` begins answering, so
+`CodeMap::bodies` (wasm framing) and `SourceMapper::resolve` (DWARF) agree only if the base is right.
+The same arithmetic holds on the 622 KB `dummy-contract` build, which additionally has four function
+**imports**: its payload begins at file offset `190` and the first defined body is address `2`, while
+that function's index in the module's index space is `4`. Code-section order, function index and file
+offset are three different numbers, and conflating any two of them is the bug class here.
+
+`CodeMap` is that translation, built during the same section walk that finds the DWARF:
+`to_code_address(file_offset)` moves a position in the file into DWARF's space, `function_at(address)`
+says which body contains it, and `SourceMapper::resolve_file_offset` does the two in order. It is
+best effort by design — a module whose function list overruns its section yields
+`SourceMapper::code_map() == None` rather than an error, because a caller already holding a DWARF
+address needs no map.
+
+What still cannot be resolved is an address from the engine, and that is a property of `wasmi` 2.0
+rather than of this stage: its only execution hook, `Store::call_hook`, passes the hook *variant*
+and nothing else — no callee, no instruction hook, no program counter — so every event the tracer
+records is written at `pc = 0` (see `docs/internals/tracer_architecture.md` and
+`ExecutionTracer::invoke_function`'s docs). It is not merely unexposed: the engine re-encodes wasm
+bytecode into its own variable-length instruction stream during translation and retains no table back
+to the original offsets, so even a leaked instruction pointer would be an index into a different
+program. The finest code-section granularity reachable at runtime is therefore a **function body**,
+which is what `CodeMap::bodies` is for. Three consequences to keep in mind when you touch this:
 
 * A mapping bug here is invisible in CI and visible in output. `resolve(0)` on a real binary
-  probably returns `None` — offset `0` is usually before the first function's line program — so a
-  broken translation shows up as an empty flamegraph, not a failing test.
+  probably returns `None` — offset `0` is the function-count byte, before the first function's line
+  program — so a broken translation shows up as an empty flamegraph, not a failing test.
+* Never treat "resolved to nothing" as "is not an instruction". Addresses `0`, `1`, `16` and `17` of
+  the fixture are inside the code section and belong to no function; `CodeMap::function_at` separates
+  those two answers, which #162's degenerate-mapping warning depends on.
 * `addr2line` probes the half-open range `[address, address + 1)`, so `u64::MAX` overflows inside the
   dependency and panics a debug build. `resolve` rejects that value before the lookup instead; no
   code section is within orders of magnitude of it.
@@ -155,8 +179,10 @@ the pair is committed and the big one is not.
 
 1. `has_debug_info()` — if `false`, read the `SourceMapError`: `MissingDebugInfo` names the sections
    that *were* present, so you can see whether there is a `name` section to fall back to.
-2. Confirm the address space. Print the code section's size and check your `pc` values fall inside
-   it; a linear-memory or file offset will resolve nothing while looking perfectly plausible.
+2. Confirm the address space. `code_map()` gives the section's extent and each body's range:
+   `to_code_address` returns `None` for an offset that is not in the code section at all, and
+   `function_at` returns `None` for one that is in it but belongs to no function — a linear-memory or
+   file offset will resolve nothing while looking perfectly plausible.
 3. Sweep, don't sample. Iterate `0..code_size` calling `find_location` and count hits — that is how
    the 160/166 figure was produced, and how the "loads but resolves 0" case was distinguished from a
    missing-section case.
