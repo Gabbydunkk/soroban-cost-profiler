@@ -636,11 +636,128 @@ impl WasmSections {
 /// language is absent or the name will not parse, it hands back the raw symbol unchanged, which is
 /// why `#[no_mangle] extern "C"` functions and C symbols arrive as plain names here.
 ///
+/// What demangling does *not* fix is the closure segments it leaves in place, so the name goes
+/// through [`collapse_closures`] before it becomes a frame.
+///
 /// `None` means "no name to build a frame from", which [`SourceMapper::resolve`] treats as
 /// unattributable; an empty string would key every such address to the same flamegraph frame.
 fn frame_name(function: &FunctionName<Reader>) -> Option<String> {
     let name = function.demangle().ok()?;
-    (!name.is_empty()).then(|| name.into_owned())
+    (!name.is_empty()).then(|| collapse_closures(&name))
+}
+
+/// Rewrite rustc's anonymous closure segments into bracketed markers.
+///
+/// Two spellings reach this function from a compiler, both measured in a `wasm32-unknown-unknown`
+/// build of a probe crate containing a closure inside a closure:
+///
+/// * `closure_probe::outer::{closure#0}` — at `debug = 2`, `opt-level = 1`, where each closure gets
+///   its own function. It is also what `rustc-demangle` renders a v0 closure into: the same crate's
+///   `name` section carries `…13closure_probe5outer0E…`, and the trailing index is the disambiguator
+///   that becomes `#0`.
+/// * `{closure_env#0}` — at `line-tables-only`, `opt-level = 3`, where the closure body is inlined
+///   into its parent and the only surviving name is the synthetic environment type inside the
+///   generic arguments of whatever takes it (`map_fold<u32, u32, u32,
+///   closure_probe::outer::{closure_env#0}, …>`).
+///
+/// `{{closure}}`, the spelling #155 names, is legacy mangling and appears in neither build. It is
+/// still handled — trimming one more brace level costs no branch — because that is what a
+/// pre-2020 `.wasm` will hand to #157's `name`-section path.
+///
+/// Each segment becomes `[closure]`, or `[closure#N]` when it carries an index, and a segment whose
+/// *entire* prefix since the previous marker is `::` is dropped rather than written:
+/// `outer::{closure#0}::{closure#1}` describes one closure frame reached by nesting, and the
+/// flamegraph has nowhere to put a stack of markers. A segment reached through anything else
+/// (`>::`, inside generic arguments) is a different closure at a different nesting level and stays.
+///
+/// The index is kept when a closure stands alone because siblings in one function are different
+/// work, and [`crate::models::CallStackNode`]'s children are keyed by `function_name` — dropping
+/// it would pool `outer`'s two closures into a single frame and lose which one spent the fuel.
+///
+/// Every other byte is preserved exactly, including segments this does not touch (`{impl#0}`,
+/// which is an anonymous impl block rather than a closure and is #155's sibling, not #155) and a
+/// `{` that never closes.
+fn collapse_closures(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    let mut after_marker = false;
+
+    while let Some(open) = rest.find('{') {
+        let Some(len) = group_len(&rest[open..]) else {
+            out.push_str(rest);
+            return out;
+        };
+        let separator = &rest[..open];
+        let marker = closure_marker(&rest[open + 1..open + len - 1]);
+
+        match marker {
+            Some(_) if after_marker && separator == "::" => rest = &rest[open + len..],
+            Some(marker) => {
+                out.push_str(separator);
+                out.push_str(&marker);
+                rest = &rest[open + len..];
+                after_marker = true;
+            }
+            None => {
+                out.push_str(separator);
+                out.push('{');
+                rest = &rest[open + 1..];
+                after_marker = false;
+            }
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// The length of the balanced `{…}` group at the front of `group`, braces included.
+///
+/// `None` when the braces never close, which leaves the caller to copy the name verbatim. Nesting
+/// is counted because a group can contain one (`{a{b}c}`), and `group_len` then spans the outer
+/// pair rather than stopping at the first `}`.
+///
+/// Cannot underflow `depth`: `group` starts at a `{`, so the count reaches zero exactly once, at
+/// the matching brace, and returns.
+fn group_len(group: &str) -> Option<usize> {
+    let mut depth = 0usize;
+
+    for (index, character) in group.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// The marker for a group's contents, or `None` when the group is not a closure segment.
+///
+/// `inner` is the text *between* the outermost braces, so the `{{closure}}` spelling arrives here
+/// as `{closure}` — trimming braces once more finds the same `closure` prefix the other forms
+/// start with. The index after `#` is kept when present; the span form (`{closure@…}`) and the
+/// fully anonymous legacy form have none, and `[closure]` is all either of them can say.
+///
+/// A segment that merely starts with the letters is not a closure — the character after `closure`
+/// has to be punctuation rustc actually uses (`#`, `_`, `@`, or nothing).
+fn closure_marker(inner: &str) -> Option<String> {
+    let core = inner.trim_matches(['{', '}']);
+    let tail = core.strip_prefix("closure")?;
+    if tail.chars().next().is_some_and(char::is_alphanumeric) {
+        return None;
+    }
+
+    match tail.find('#') {
+        Some(index) if tail.len() > index + 1 => Some(format!("[closure#{}]", &tail[index + 1..])),
+        _ => Some("[closure]".to_string()),
+    }
 }
 
 /// Whether a custom section is worth keeping in memory.
@@ -922,6 +1039,136 @@ mod tests {
             frame.file_path
         );
         assert!(frame.line_number.is_some_and(|line| line > 0));
+    }
+
+    /// One frame measured out of a `debug = 2`, `opt-level = 1` `wasm32-unknown-unknown` build of a
+    /// probe crate whose `outer` holds a closure that holds a closure, copied from what
+    /// `addr2line` handed `frame_name` after demangling. Every `{closure#0}` in it is a real closure
+    /// segment at a real nesting level, and the whole string is what a flamegraph frame has to
+    /// render.
+    const MEASURED_CLOSURE_FRAME: &str = "<core::ops::range::Range<u32> as core::iter::traits::iterator::Iterator>::fold::<u32, core::iter::adapters::map::map_fold<u32, u32, u32, closure_probe::outer::{closure#0}, <u32 as core::iter::traits::accum::Sum>::sum<core::iter::adapters::map::Map<core::ops::range::Range<u32>, closure_probe::outer::{closure#0}>>::{closure#0}>::{closure#0}>";
+
+    #[test]
+    fn nested_closure_segments_collapse_into_one_marker() {
+        // #155's acceptance criterion, in the two spellings a compiler actually produces plus the
+        // one the issue names. The nested segment and its `::` both go, because a run of them
+        // describes one closure frame reached by nesting and the outer index is the one that
+        // identifies it.
+        assert_eq!(
+            collapse_closures("outer::{closure#0}::{closure#1}"),
+            "outer::[closure#0]"
+        );
+        assert_eq!(
+            collapse_closures("dummy_contract::call::{{closure}}::{{closure}}::{{closure}}"),
+            "dummy_contract::call::[closure]"
+        );
+        // Mixed spellings in one run still collapse: the second segment is the legacy form.
+        assert_eq!(
+            collapse_closures("a::{closure}::{{closure}}::b"),
+            "a::[closure]::b"
+        );
+        // A span-form segment names no index, so the marker says only what it can.
+        assert_eq!(
+            collapse_closures("sort::{closure@src/lib.rs:12:9: 12:20}"),
+            "sort::[closure]"
+        );
+    }
+
+    #[test]
+    fn closures_that_are_not_nested_keep_their_index() {
+        // The other half of the rule, and the reason the marker is not a flat `[closure]`: these two
+        // are different closures in the same function, reached from different addresses, and
+        // `CallStackNode`'s children are keyed by name. Merging them would pool two costs into one
+        // frame with nothing in the trace to explain it.
+        let first = collapse_closures("outer::{closure#0}");
+        let second = collapse_closures("outer::{closure#1}");
+
+        assert_eq!(first, "outer::[closure#0]");
+        assert_eq!(second, "outer::[closure#1]");
+        assert_ne!(first, second);
+
+        // The `{closure_env#N}` spelling is the environment type of the same closure, so it gets
+        // the same marker rather than a fourth thing to tell apart.
+        assert_eq!(
+            collapse_closures("map_fold<u32, closure_probe::outer::{closure_env#0}>"),
+            "map_fold<u32, closure_probe::outer::[closure#0]>"
+        );
+    }
+
+    #[test]
+    fn the_measured_closure_frame_renders_without_braces() {
+        // Four closure segments, only two of which are adjacent: the `>::` between the third and
+        // fourth is a generic-argument boundary, so those are different closures at different
+        // nesting levels and both markers stay. Everything outside a `{…}` group is untouched,
+        // including the generic arguments that make this name long.
+        let cleaned = collapse_closures(MEASURED_CLOSURE_FRAME);
+        let expected = "<core::ops::range::Range<u32> as core::iter::traits::iterator::Iterator>::fold::<u32, core::iter::adapters::map::map_fold<u32, u32, u32, closure_probe::outer::[closure#0], <u32 as core::iter::traits::accum::Sum>::sum<core::iter::adapters::map::Map<core::ops::range::Range<u32>, closure_probe::outer::[closure#0]>>::[closure#0]>::[closure#0]>";
+
+        assert_eq!(cleaned, expected);
+        assert!(
+            !cleaned.contains("closure#0}"),
+            "a brace survived: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_closure_segment_is_returned_byte_for_byte() {
+        // The rewrite must not be a reformatting. `{impl#0}` is an anonymous impl block, not a
+        // closure (its own cleanup, not #155's); a leading `::` and an empty name are the shapes a
+        // split-and-rejoin implementation would silently corrupt.
+        for name in [
+            "caller_of_heavy",
+            "<u64>::wrapping_add",
+            "<T as core::fmt::Debug>::fmt",
+            "core::fmt::builders::{impl#0}::is_pretty",
+            "Vec<u32, alloc::global_alloc>::push",
+            "::leading",
+            "a::b::c",
+            "",
+            "no braces but a stray }{",
+            "closure",
+            "closures",
+            "my_closure_factory",
+        ] {
+            assert_eq!(collapse_closures(name), name, "{name} was changed");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_brace_is_copied_rather_than_parsed() {
+        // A truncated or hand-edited symbol can end mid-segment. `group_len` answers `None` and the
+        // rest is copied verbatim, so the frame still gets a name instead of a panic or a swallow.
+        assert_eq!(collapse_closures("outer::{closure#0"), "outer::{closure#0");
+        assert_eq!(
+            collapse_closures("outer::{closure#0}::{tail"),
+            "outer::[closure#0]::{tail"
+        );
+        // Nesting is counted, so an inner group does not end the outer one early.
+        assert_eq!(
+            collapse_closures("f<{a{b}c}>::{closure#0}"),
+            "f<{a{b}c}>::[closure#0]"
+        );
+    }
+
+    #[test]
+    fn every_frame_the_fixture_yields_survives_the_rewrite_unchanged() {
+        // The collateral-damage check on a real binary rather than on strings: this fixture's
+        // demangled names (`caller_of_heavy`, `<u64>::wrapping_add`, and the rest) carry no closure
+        // segment, so #155 must not touch any of them. If the rewrite ever eats a byte from a name
+        // that has no closure in it, this fails on the same binary #145-#153 were pinned against.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        for address in 0..166 {
+            let Some(name) = mapper.resolve(address).map(|frame| frame.function_name) else {
+                continue;
+            };
+
+            assert_eq!(
+                collapse_closures(&name),
+                name,
+                "address {address} named {name:?} was rewritten"
+            );
+        }
     }
 
     #[test]
