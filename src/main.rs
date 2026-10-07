@@ -145,8 +145,13 @@ fn run_target(
         .set_fuel(u64::MAX)
         .map_err(|error| format!("failed to enable fuel metering: {error}"))?;
 
-    let instance = instantiate_module(&engine, &mut store, &module)
-        .map_err(|error| format!("failed to instantiate module: {error}"))?;
+    let instance = match instantiate_module(&engine, &mut store, &module) {
+        Ok(inst) => inst,
+        Err(error) => {
+            tracing::error!("Failed to instantiate module: {error}");
+            return Ok((store.into_data().tracer.flush_trace(), vec![]));
+        }
+    };
 
     // Sized and typed from the signature: a contract returning `u64` gets an `I64` slot, and a
     // void one runs on an empty buffer.
@@ -159,10 +164,17 @@ fn run_target(
         .map(|ty| Val::default_for_ty(*ty))
         .collect();
 
-    let values = invoke_function(&mut store, &instance, fn_name, &[], &mut results)
-        .map(|()| results)
-        .map_err(|error| format!("execution of '{fn_name}' failed: {error}"))?;
-    Ok((store.data_mut().tracer.flush_trace(), values))
+    let values = match invoke_function(&mut store, &instance, fn_name, &[], &mut results) {
+        Ok(()) => {
+            tracing::info!("WASM execution completed successfully.");
+            results
+        }
+        Err(error) => {
+            tracing::error!("WASM execution trapped/panicked: {error}. Flushing partial trace.");
+            vec![] // Return empty values, but we still flush below
+        }
+    };
+    Ok((store.into_data().tracer.flush_trace(), values))
 }
 
 /// Run the whole pipeline for one CLI invocation: write the folded stack to `--output` and print
