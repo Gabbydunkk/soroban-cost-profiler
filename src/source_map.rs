@@ -1,4 +1,5 @@
 use crate::models::SourceFrame;
+use addr2line::FunctionName;
 use std::rc::Rc;
 
 /// The reader type `addr2line` is instantiated with.
@@ -131,10 +132,12 @@ impl std::error::Error for SourceMapError {}
 /// * **DWARF addresses are code-section-relative, and `wasmi` never hands us one.** Looking up
 ///   `4`, `8` and `16` in that build returned `src/lib.rs:2` (the function's signature) and
 ///   `64` returned `src/lib.rs:5` (its loop body) — offsets into the code section, matching
-///   #153's translation note. [`SourceMapper::resolve`] still returns `None` for every
-///   address because the *other* half is missing: `wasmi` 2.0 gives a call hook no program
-///   counter and offers no instruction hook at all, so every event `invoke_function` records is
-///   written at `pc = 0`. See [`invoke_function`] for what the hooks can and cannot see.
+///   #153's translation note. [`SourceMapper::resolve`] now turns such an offset into a frame:
+///   sweeping the committed fixture's code section resolves 160 of its 166 addresses, 133 of them
+///   to a line. What is still missing is an address worth resolving, because `wasmi` 2.0 gives a
+///   call hook no program counter and offers no instruction hook at all, so every event
+///   `invoke_function` records is written at `pc = 0`. See [`invoke_function`] for what the hooks
+///   can and cannot see.
 /// * **The `name` section survives this build path**, so a function-name-only fallback is real
 ///   (#157); a plain `cargo build` does not strip it, while
 ///   `stellar contract build` does. That is the precedence the docs should describe: DWARF ->
@@ -243,11 +246,21 @@ impl SourceMapper {
 
     /// Resolve one program counter to the source frame that produced it.
     ///
-    /// Returns `None` whenever the address cannot be attributed to a source line — no DWARF, an
-    /// address outside every range, or a pc that was never a real offset. It never panics and
-    /// never returns a half-filled frame, because aggregation calls this for every event: a frame
-    /// with an empty function name would add an anonymous root to the tree and silently absorb
-    /// the cost of everything unattributed.
+    /// `pc` is an offset into the WASM **code section**, the address space the DWARF line tables
+    /// are written against; #153 owns translating whatever the engine reports into that form.
+    ///
+    /// Returns `None` when the address has no function to name: no DWARF loaded, an address
+    /// outside every range, one too large to be a code-section offset, a lookup that `gimli`
+    /// could not complete, or a frame whose name is empty. The name is what makes a frame, because `CallStackNode`'s children are keyed by
+    /// `function_name` — an unnamed frame would pool every unattributable address into one
+    /// anonymous root and quietly absorb their cost. The location fields stay optional and
+    /// independent: measured against `fixtures/dwarf_probe`, code-section address `2` yields a
+    /// name and no location at all (the prologue precedes the first line program), and `61`..`71`
+    /// yield a file with no line.
+    ///
+    /// The frame is the **innermost** one at that address, which for inlined code is the inlined
+    /// function rather than its caller: address `14` resolves to `<u64>::wrapping_add` inside
+    /// `caller_of_heavy`. Keeping the whole inline stack is #156.
     ///
     /// Takes `&self`, so one mapper can serve a whole trace, and #158's cache would make it
     /// `&mut self` — a change to weigh against `aggregate` holding `&SourceMapper`.
@@ -260,14 +273,38 @@ impl SourceMapper {
     /// // A mapper without symbols resolves nothing, and must not panic.
     /// let mapper = SourceMapper::unmapped();
     /// assert!(mapper.resolve(0).is_none());
+    ///
+    /// // A real build resolves: this fixture is Rust code compiled for wasm32-unknown-unknown.
+    /// let fixture = include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm");
+    /// let mapper = SourceMapper::new(fixture).expect("the fixture carries DWARF");
+    /// let frame = mapper.resolve(3).expect("address 3 is inside `caller_of_heavy`");
+    /// assert_eq!(frame.function_name, "caller_of_heavy");
+    /// assert_eq!(frame.line_number, Some(39));
     /// ```
-    pub fn resolve(&self, _pc: usize) -> Option<SourceFrame> {
-        // The context is loaded and ready. What is missing is an address worth querying it with:
-        // `wasmi` gives the tracer no program counter (see the module docs), and the offsets it
-        // does report would still need #153's translation to code-section-relative form.
-        // Phase 3's `Map WASM PC to File Path / Line Number / Function Name` issues fill this in
-        // against the fixture that now carries real DWARF.
-        None
+    pub fn resolve(&self, pc: usize) -> Option<SourceFrame> {
+        let context = self.context.as_ref()?;
+
+        // `addr2line` probes the half-open range `[address, address + 1)`, so `u64::MAX` overflows
+        // inside that computation and panics a debug build. No code section is within orders of
+        // magnitude of that, so an address this high is not an offset and gets the same answer as
+        // any other address outside every range.
+        let address = u64::try_from(pc).ok()?;
+        if address == u64::MAX {
+            return None;
+        }
+
+        // `skip_all_loads`: every section was copied into the reader at construction, so there is
+        // nothing to load, and a split-DWARF request would try to open a file that never existed.
+        let mut frames = context.find_frames(address).skip_all_loads().ok()?;
+        let frame = frames.next().ok()??;
+        let function_name = frame_name(frame.function.as_ref()?)?;
+
+        let location = frame.location.as_ref();
+        Some(SourceFrame {
+            function_name,
+            file_path: location.and_then(|loc| loc.file).map(str::to_string),
+            line_number: location.and_then(|loc| loc.line),
+        })
     }
 }
 
@@ -398,6 +435,21 @@ impl WasmSections {
     fn custom_names(&self) -> Vec<String> {
         self.retained.iter().map(|(name, _)| name.clone()).collect()
     }
+}
+
+/// The name to put in a frame, demangled where the DWARF says how.
+///
+/// `addr2line`'s `demangle()` applies `rustc-demangle` for `DW_LANG_Rust` and uses its *alternate*
+/// format, which drops the `-<hash>` suffixes crate symbols carry — the difference between
+/// `_RNvNtNtCs..17soroban_env_guest5guest3vec13vec_push_back` and a readable path. When the
+/// language is absent or the name will not parse, it hands back the raw symbol unchanged, which is
+/// why `#[no_mangle] extern "C"` functions and C symbols arrive as plain names here.
+///
+/// `None` means "no name to build a frame from", which [`SourceMapper::resolve`] treats as
+/// unattributable; an empty string would key every such address to the same flamegraph frame.
+fn frame_name(function: &FunctionName<Reader>) -> Option<String> {
+    let name = function.demangle().ok()?;
+    (!name.is_empty()).then(|| name.into_owned())
 }
 
 /// Whether a custom section is worth keeping in memory.
@@ -587,6 +639,145 @@ mod tests {
         assert!(!reason.is_empty(), "and say what gimli objected to");
     }
 
+    /// The frame the fixture's DWARF gives for `pc`, with a failure that names the address.
+    fn frame_at(mapper: &SourceMapper, pc: usize) -> SourceFrame {
+        mapper
+            .resolve(pc)
+            .unwrap_or_else(|| panic!("pc {pc} lies inside the fixture's code section"))
+    }
+
+    #[test]
+    fn a_code_offset_resolves_to_its_function_file_and_line() {
+        // One address from the middle of each of the fixture's three functions. `pc` is
+        // code-section-relative, which is the form #153 hands to this call. The line is checked
+        // against the function's source span rather than a single number so that rebuilding the
+        // fixture with a different toolchain cannot fail the test for the wrong reason.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        for (pc, function, span) in [
+            (3usize, "caller_of_heavy", 38..=40u32),
+            (20, "memory_heavy_loop", 21..=35),
+            (158, "compute_heavy_loop", 10..=18),
+        ] {
+            let frame = frame_at(&mapper, pc);
+
+            assert_eq!(
+                frame.function_name, function,
+                "pc {pc} named the wrong function"
+            );
+            assert!(
+                frame
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|file| file.ends_with("fixtures/dwarf_probe/src/lib.rs")),
+                "pc {pc} resolved to {:?}, not the fixture's only source file",
+                frame.file_path
+            );
+            let line = frame
+                .line_number
+                .unwrap_or_else(|| panic!("pc {pc} in `{function}` should carry a line number"));
+            assert!(
+                span.contains(&line),
+                "pc {pc} resolved to `{function}:{line}`, outside its span {span:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prologue_resolves_a_function_name_with_no_location() {
+        // The first instructions of `caller_of_heavy` precede the line program's first entry, so
+        // DWARF knows the function but not the line. Cost still has to land somewhere, so a name
+        // is enough to make a frame, and the two location fields stay `None` rather than becoming
+        // line 0. (`61`..`71` are the mirror case: a file and no line.)
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        let frame = frame_at(&mapper, 2);
+
+        assert_eq!(frame.function_name, "caller_of_heavy");
+        assert_eq!(frame.file_path, None);
+        assert_eq!(frame.line_number, None);
+    }
+
+    #[test]
+    fn a_frame_in_inlined_dependency_code_is_demangled() {
+        // `caller_of_heavy`'s body inlines `u64::wrapping_add`, so the innermost frame at `14` is
+        // core code reached through a Rust v0 symbol. This is the whole of #148's example
+        // (`my_contract::swap` is the same kind of name) and it shows the frame pointing at a
+        // registry path next to the contract's own -- the reason anything that groups frames by
+        // file has to expect both.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        let frame = frame_at(&mapper, 14);
+
+        assert_eq!(frame.function_name, "<u64>::wrapping_add");
+        assert!(
+            frame
+                .file_path
+                .as_deref()
+                .is_some_and(|file| file.ends_with("core/src/num/uint_macros.rs")),
+            "expected inlined core code, got {:?}",
+            frame.file_path
+        );
+        assert!(frame.line_number.is_some_and(|line| line > 0));
+    }
+
+    #[test]
+    fn resolution_covers_most_of_the_code_section() {
+        // Not "DWARF is present" but "DWARF maps an executed address": the fixture's code section
+        // is 165 bytes, and one address per byte is swept. 160 of those 166 resolve; the rest are
+        // the two-byte gaps between functions and the address past the end.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        let frames: Vec<SourceFrame> = (0..166usize).filter_map(|pc| mapper.resolve(pc)).collect();
+        let names: Vec<&str> = frames
+            .iter()
+            .map(|frame| frame.function_name.as_str())
+            .collect();
+
+        assert!(
+            frames.len() > 150,
+            "only {} of 166 code-section offsets resolved",
+            frames.len()
+        );
+        for function in ["caller_of_heavy", "memory_heavy_loop", "compute_heavy_loop"] {
+            assert!(
+                names.contains(&function),
+                "`{function}` was never named; frames resolved as {names:?}"
+            );
+        }
+        for frame in &frames {
+            assert!(!frame.function_name.is_empty(), "an empty frame: {frame:?}");
+            assert!(
+                !frame.function_name.starts_with("_R"),
+                "a mangled symbol reached a frame: {:?}",
+                frame.function_name
+            );
+        }
+    }
+
+    #[test]
+    fn addresses_outside_the_code_section_resolve_to_nothing() {
+        // The gaps between functions (`16`, `17`, `157`), the first address past the end (`166`),
+        // and the values a mis-translated or uninitialised pc looks like. `usize::MAX` is the
+        // interesting one: `addr2line` probes `[address, address + 1)` and overflows on it, which
+        // would panic a debug build rather than report an unattributable address.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        for pc in [
+            0usize,
+            1,
+            16,
+            17,
+            157,
+            166,
+            4096,
+            1 << 20,
+            usize::MAX - 1,
+            usize::MAX,
+        ] {
+            assert_eq!(mapper.resolve(pc), None, "pc {pc} should not resolve");
+        }
+    }
     #[test]
     fn an_unmapped_mapper_resolves_nothing_at_any_address() {
         let mapper = SourceMapper::unmapped();
