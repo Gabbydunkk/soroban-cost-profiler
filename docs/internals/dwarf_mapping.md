@@ -88,16 +88,18 @@ which is what `CodeMap::bodies` is for. Three consequences to keep in mind when 
 column) and a `function` (the symbol, plus its DWARF language). One call therefore answers file, line
 and name — which is why `resolve` does not also call `find_location`.
 
-Sweeping every byte offset of `fixtures/dwarf_probe/dwarf_probe.wasm`'s 165-byte code section gives
-160 frames and 133 lines. The six misses (`0`, `1`, `16`, `17`, `157`, `165`) are gaps between
-function ranges, and the hits are not uniform either:
+Sweeping every byte offset of `fixtures/dwarf_probe/dwarf_probe.wasm`'s 165-byte code section answers
+160 of its 166 addresses with 170 frames — ten of those addresses are inlined call sites — and 133 of
+them with a line. The six misses (`0`, `1`, `16`, `17`, `157`, `165`) are gaps between function
+ranges, and the hits are not uniform either. Each row below is that address's **innermost** frame;
+`resolve` also hands back whatever inlined it (see *Inlined frames*).
 
 | address | function name | file | line | why |
 | --- | --- | --- | --- | --- |
 | `0`, `1` | — | — | — | before the first function's range |
 | `2` | `caller_of_heavy` | *none* | *none* | the prologue precedes the first line-program entry |
 | `3`–`13` | `caller_of_heavy` | `…/src/lib.rs` | `39` | the call on the function's last line |
-| `14` | `<u64>::wrapping_add` | `…/library/core/src/num/uint_macros.rs` | `2612` | inlined core code, innermost frame wins |
+| `14` | `<u64>::wrapping_add` | `…/library/core/src/num/uint_macros.rs` | `2612` | inlined core code; the stack's second frame is `caller_of_heavy` at `39` |
 | `15` | `caller_of_heavy` | `…/src/lib.rs` | `40` | back to the caller after that inlined copy |
 | `16`, `17` | — | — | — | gap between function ranges |
 | `61`–`71`, `75`–`89` | `memory_heavy_loop` | `…/src/lib.rs` | *none* | 26 addresses with a file and no line |
@@ -112,21 +114,33 @@ So `SourceFrame`'s three fields have three different contracts, and this is deli
 
 * `function_name: String` is **required**. `CallStackNode`'s children are keyed by function name, so
   an unnamed frame would pool every unattributable address into one anonymous root and quietly absorb
-  their cost. `resolve` returns `None` rather than build one.
+  their cost. A frame DWARF gives no name for is dropped from the stack rather than built, and an
+  address whose frames are all nameless answers with an empty `Vec`.
 * `file_path` and `line_number` are **independent** `Option`s. A stripped build can still yield a
   name; a line table can still yield a file with no line. Never fold a missing line into `Some(0)` —
   line 0 is a real value in some DWARF, and `Option` is what distinguishes "absent" from "line zero".
 
 ## Inlined frames
 
-`find_frames` yields innermost-first: for address `14` the first frame is `<u64>::wrapping_add` in
-core and the second is `caller_of_heavy`, whose source line actually contains the call. `resolve`
-takes the first, because at a leaf address the inlined function is the thing that executed — the
-distinction that makes a flamegraph actionable rather than merely correct-looking.
+`resolve` returns the **whole inline stack**, innermost frame first, because one frame per address
+cannot say both what executed and who inlined it. For address `14` that is two frames:
+`<u64>::wrapping_add` at `…/core/src/num/uint_macros.rs:2612`, then `caller_of_heavy` at
+`…/src/lib.rs:39` — the second frame's line is the call site, which is the half a flamegraph reader
+usually wants and the half a single-frame API threw away.
 
-The whole stack is what a real flamegraph wants, and that is #156: change `resolve` to return
-`Vec<SourceFrame>` and have the aggregator push each entry as a stack level. Nothing about the
-lookup changes; only how many `next()` calls you make.
+Measured over the fixture's 166 code-section addresses: 6 answer with nothing (the framing gaps), 150
+with one frame, and 10 with two — `14`, and `101`..=`109`, the nine bytes of `memory_heavy_loop`
+whose inlined `wrapping_add` all resolve to the same stack. `the_stack_depth_is_measured_across_the_whole_code_section`
+pins that vector, so a fixture rebuild that changes the shape fails loudly instead of silently
+changing what a profile looks like.
+
+`ProfileAggregator` keys each frame on `stack[0]` and ignores the rest. That is deliberate, not
+unfinished: the engine reports one boundary per wasm call
+(`only_the_outer_invocation_is_recorded_as_a_boundary`), so pushing the inline stack as extra tree
+levels would draw WASM frames for calls that never happened and move cost off the frame that paid
+it. The stack's value today is the *call-site* line, which a reader can get from `stack[1]`; using it
+to render inlined depth in the output is a Stage 4 formatting question, and nobody has measured what
+it costs yet.
 
 ## Demangling
 

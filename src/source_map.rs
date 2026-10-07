@@ -262,26 +262,31 @@ impl SourceMapper {
         self.context.is_some()
     }
 
-    /// Resolve one program counter to the source frame that produced it.
+    /// Resolve one program counter to the inline stack that produced it, innermost frame first.
     ///
     /// `pc` is an offset into the WASM **code section**, the address space the DWARF line tables
     /// are written against; #153 owns translating whatever the engine reports into that form.
     ///
-    /// Returns `None` when the address has no function to name: no DWARF loaded, an address
-    /// outside every range, one too large to be a code-section offset, a lookup that `gimli`
-    /// could not complete, or a frame whose name is empty. The name is what makes a frame, because `CallStackNode`'s children are keyed by
-    /// `function_name` — an unnamed frame would pool every unattributable address into one
-    /// anonymous root and quietly absorb their cost. The location fields stay optional and
-    /// independent: measured against `fixtures/dwarf_probe`, code-section address `2` yields a
-    /// name and no location at all (the prologue precedes the first line program), and `61`..`71`
-    /// yield a file with no line.
+    /// The order is the one `addr2line` walks a stack: the inlined function, then whoever inlined
+    /// it, down to the function the wasm call actually entered. Measured against
+    /// `fixtures/dwarf_probe`, 160 of its 166 code-section addresses answer at all and **10 of
+    /// those answer with two frames** — address `14` is `<u64>::wrapping_add` inside
+    /// `caller_of_heavy`, each with its own file and line, which is the reason one `SourceFrame`
+    /// per address cannot describe what ran.
     ///
-    /// The frame is the **innermost** one at that address, which for inlined code is the inlined
-    /// function rather than its caller: address `14` resolves to `<u64>::wrapping_add` inside
-    /// `caller_of_heavy`. Keeping the whole inline stack is #156.
+    /// An empty `Vec` means "nothing attributable here": no DWARF loaded, an address outside every
+    /// range, one too large to be a code-section offset, or a lookup `gimli` could not complete. A
+    /// frame DWARF gives no name for is dropped rather than ending the stack — it cannot be a
+    /// [`crate::models::CallStackNode`] key, but the callers beneath it still can be, so the name
+    /// rule no longer costs a whole address its attribution the way it did when only the innermost
+    /// frame was read. The location fields stay optional and independent: address `2` yields a name
+    /// and no location at all (the prologue precedes the first line program), and `61`..`71` yield
+    /// a file with no line.
     ///
     /// Takes `&self`, so one mapper can serve a whole trace, and #158's cache would make it
-    /// `&mut self` — a change to weigh against `aggregate` holding `&SourceMapper`.
+    /// `&mut self` — a change to weigh against `aggregate` holding `&SourceMapper`. Allocating one
+    /// `Vec` per event sits inside `AGENTS.md`'s OOM rule for the same reason the rest of Stage 2
+    /// does: the tracer emits one event per call boundary, not per instruction.
     ///
     /// # Examples
     ///
@@ -290,39 +295,62 @@ impl SourceMapper {
     ///
     /// // A mapper without symbols resolves nothing, and must not panic.
     /// let mapper = SourceMapper::unmapped();
-    /// assert!(mapper.resolve(0).is_none());
+    /// assert!(mapper.resolve(0).is_empty());
     ///
     /// // A real build resolves: this fixture is Rust code compiled for wasm32-unknown-unknown.
     /// let fixture = include_bytes!("../fixtures/dwarf_probe/dwarf_probe.wasm");
     /// let mapper = SourceMapper::new(fixture).expect("the fixture carries DWARF");
-    /// let frame = mapper.resolve(3).expect("address 3 is inside `caller_of_heavy`");
-    /// assert_eq!(frame.function_name, "caller_of_heavy");
-    /// assert_eq!(frame.line_number, Some(39));
+    /// let stack = mapper.resolve(3);
+    /// assert_eq!(stack.len(), 1, "address 3 is not an inlined call site");
+    /// assert_eq!(stack[0].function_name, "caller_of_heavy");
+    /// assert_eq!(stack[0].line_number, Some(39));
+    ///
+    /// // Address 14 is inlined core code, so the stack names both halves, innermost first.
+    /// let stack = mapper.resolve(14);
+    /// let names: Vec<&str> = stack.iter().map(|frame| frame.function_name.as_str()).collect();
+    /// assert_eq!(names, ["<u64>::wrapping_add", "caller_of_heavy"]);
+    /// assert_eq!(stack[1].line_number, Some(39), "the caller's line is the call site");
     /// ```
-    pub fn resolve(&self, pc: usize) -> Option<SourceFrame> {
-        let context = self.context.as_ref()?;
+    pub fn resolve(&self, pc: usize) -> Vec<SourceFrame> {
+        let Some(context) = self.context.as_ref() else {
+            return Vec::new();
+        };
 
         // `addr2line` probes the half-open range `[address, address + 1)`, so `u64::MAX` overflows
         // inside that computation and panics a debug build. No code section is within orders of
         // magnitude of that, so an address this high is not an offset and gets the same answer as
         // any other address outside every range.
-        let address = u64::try_from(pc).ok()?;
+        let Ok(address) = u64::try_from(pc) else {
+            return Vec::new();
+        };
         if address == u64::MAX {
-            return None;
+            return Vec::new();
         }
 
         // `skip_all_loads`: every section was copied into the reader at construction, so there is
         // nothing to load, and a split-DWARF request would try to open a file that never existed.
-        let mut frames = context.find_frames(address).skip_all_loads().ok()?;
-        let frame = frames.next().ok()??;
-        let function_name = frame_name(frame.function.as_ref()?)?;
+        let Ok(mut frames) = context.find_frames(address).skip_all_loads() else {
+            return Vec::new();
+        };
 
-        let location = frame.location.as_ref();
-        Some(SourceFrame {
-            function_name,
-            file_path: location.and_then(|loc| loc.file).map(str::to_string),
-            line_number: location.and_then(|loc| loc.line),
-        })
+        // A `gimli` error partway through the stack stops the walk and keeps what was collected:
+        // the frames already read are ones the trace can be charged to, and dropping them because a
+        // frame further out is unreadable would throw away real attribution.
+        let mut stack = Vec::new();
+        while let Ok(Some(frame)) = frames.next() {
+            let Some(function_name) = frame.function.as_ref().and_then(frame_name) else {
+                continue;
+            };
+
+            let location = frame.location.as_ref();
+            stack.push(SourceFrame {
+                function_name,
+                file_path: location.and_then(|loc| loc.file).map(str::to_string),
+                line_number: location.and_then(|loc| loc.line),
+            });
+        }
+
+        stack
     }
 
     /// Where this binary's code section is, for translating a position in the file.
@@ -335,7 +363,7 @@ impl SourceMapper {
         self.code.as_ref()
     }
 
-    /// Resolve a byte offset *in the file* to the source frame that produced it.
+    /// Resolve a byte offset *in the file* to the inline stack that produced it.
     ///
     /// The same lookup as [`SourceMapper::resolve`], one address space earlier: the offset is moved
     /// into code-section-relative form by [`CodeMap::to_code_address`] before DWARF is asked, which
@@ -345,8 +373,8 @@ impl SourceMapper {
     /// Use this for anything that reads the binary — a section walk, a `wasm-objdump` figure, a
     /// hand-checked offset. Use [`SourceMapper::resolve`] for anything already in DWARF's space.
     ///
-    /// Returns `None` if this mapper has no [`CodeMap`], if the offset is outside the code section,
-    /// or if the translated address resolves to no frame.
+    /// Returns an empty `Vec` if this mapper has no [`CodeMap`], if the offset is outside the code
+    /// section, or if the translated address resolves to no frame.
     ///
     /// # Examples
     ///
@@ -363,14 +391,25 @@ impl SourceMapper {
     /// assert_eq!(map.to_code_address(111), Some(0));
     /// assert_eq!(map.to_code_address(110), None, "before the section is not in it");
     ///
-    /// let frame = mapper
-    ///     .resolve_file_offset(114)
-    ///     .expect("file offset 114 is code address 3");
-    /// assert_eq!(frame.function_name, "caller_of_heavy");
-    /// assert_eq!(frame.line_number, Some(39));
+    /// let stack = mapper.resolve_file_offset(114);
+    /// assert_eq!(stack.len(), 1, "file offset 114 is code address 3");
+    /// assert_eq!(stack[0].function_name, "caller_of_heavy");
+    /// assert_eq!(stack[0].line_number, Some(39));
+    ///
+    /// // The offset translation reaches inlined code on the same two frames `resolve` names.
+    /// let stack = mapper.resolve_file_offset(125);
+    /// assert_eq!(stack.len(), 2, "file offset 125 is code address 14");
+    /// assert_eq!(stack[0].function_name, "<u64>::wrapping_add");
     /// ```
-    pub fn resolve_file_offset(&self, file_offset: usize) -> Option<SourceFrame> {
-        let address = self.code.as_ref()?.to_code_address(file_offset)?;
+    pub fn resolve_file_offset(&self, file_offset: usize) -> Vec<SourceFrame> {
+        let Some(address) = self
+            .code
+            .as_ref()
+            .and_then(|map| map.to_code_address(file_offset))
+        else {
+            return Vec::new();
+        };
+
         self.resolve(address)
     }
 }
@@ -406,8 +445,9 @@ impl SourceMapper {
 /// assert_eq!(map.function_at(2), Some(0));
 /// assert_eq!(map.function_at(0), None, "the count byte belongs to no function body");
 /// for (index, body) in bodies.iter().enumerate() {
-///     let frame = mapper.resolve(body.start).expect("a body's first byte is its prologue");
-///     assert_eq!(map.function_at(body.start), Some(index), "{frame:?}");
+///     let stack = mapper.resolve(body.start);
+///     assert!(!stack.is_empty(), "a body's first byte is its prologue");
+///     assert_eq!(map.function_at(body.start), Some(index), "{stack:?}");
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -959,10 +999,13 @@ mod tests {
         assert!(!reason.is_empty(), "and say what gimli objected to");
     }
 
-    /// The frame the fixture's DWARF gives for `pc`, with a failure that names the address.
+    /// The innermost frame the fixture's DWARF gives for `pc`, with a failure that names the
+    /// address. Tests that care about the rest of the inline stack read `resolve` directly.
     fn frame_at(mapper: &SourceMapper, pc: usize) -> SourceFrame {
         mapper
             .resolve(pc)
+            .into_iter()
+            .next()
             .unwrap_or_else(|| panic!("pc {pc} lies inside the fixture's code section"))
     }
 
@@ -1039,6 +1082,110 @@ mod tests {
             frame.file_path
         );
         assert!(frame.line_number.is_some_and(|line| line > 0));
+    }
+
+    #[test]
+    fn an_inlined_call_site_answers_with_the_whole_stack_innermost_first() {
+        // #156's acceptance criterion, on the fixture's own inlined call. Address `14` is
+        // `wrapping_add` inlined into `caller_of_heavy`, and the two frames name different files
+        // *and* different lines: one `SourceFrame` per address could say which code the address is,
+        // but never which call site put it there. The order is the one `addr2line` walks -- callee
+        // first, caller last -- so `stack[0]` stays the frame the tree keys on and the callers
+        // beneath it are available to anyone who wants the depth.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        let stack = mapper.resolve(14);
+        let names: Vec<&str> = stack
+            .iter()
+            .map(|frame| frame.function_name.as_str())
+            .collect();
+
+        assert_eq!(names, ["<u64>::wrapping_add", "caller_of_heavy"]);
+        assert_eq!(
+            stack[0].line_number,
+            Some(2612),
+            "core's line, from the fixture's DWARF"
+        );
+        assert_eq!(stack[1].line_number, Some(39), "the contract's call site");
+        assert_ne!(
+            stack[0].file_path, stack[1].file_path,
+            "an inline stack whose frames share a file is a different shape than this one: {stack:?}"
+        );
+    }
+
+    #[test]
+    fn the_stack_depth_is_measured_across_the_whole_code_section() {
+        // Not one hand-picked address but the fixture's entire 166-byte code section, because the
+        // interesting fact is the *distribution*: inlining is the exception here, not the rule. 6
+        // addresses are framing bytes that belong to no instruction, 150 yield one frame, and 10
+        // yield two -- `14` in `caller_of_heavy`, then `101`..=`109`, nine consecutive bytes of
+        // `memory_heavy_loop`'s inlined `wrapping_add`. Nothing is deeper than two, which is what a
+        // three-line fixture should produce; a third level would mean the walk is reading past the
+        // function that owns the address.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+
+        let depths: Vec<(usize, usize)> = (0..166usize)
+            .map(|pc| (pc, mapper.resolve(pc).len()))
+            .filter(|(_, depth)| *depth != 1)
+            .collect();
+        let singles = 166 - depths.len();
+
+        assert_eq!(
+            depths,
+            vec![
+                (0, 0),
+                (1, 0),
+                (14, 2),
+                (16, 0),
+                (17, 0),
+                (101, 2),
+                (102, 2),
+                (103, 2),
+                (104, 2),
+                (105, 2),
+                (106, 2),
+                (107, 2),
+                (108, 2),
+                (109, 2),
+                (157, 0),
+                (165, 0),
+            ]
+        );
+        assert_eq!(singles, 150);
+
+        // The nine inlined bytes of one loop body are the same call, so they must be the same stack
+        // -- otherwise the tree would pool them under nine different names.
+        let loop_stack = mapper.resolve(101);
+        for address in 101..110 {
+            assert_eq!(mapper.resolve(address), loop_stack, "address {address}");
+        }
+        assert_eq!(
+            loop_stack
+                .iter()
+                .map(|frame| frame.function_name.as_str())
+                .collect::<Vec<_>>(),
+            ["<u64>::wrapping_add", "memory_heavy_loop"]
+        );
+    }
+
+    #[test]
+    fn every_stack_ends_in_a_function_the_contract_exports() {
+        // The outermost frame is the one a wasm call boundary can name, so `addr2line`'s walk has to
+        // finish there: if a stack ever bottomed out inside `core`, the depth Stage 3 would build
+        // from it is wrong rather than merely richer.
+        let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
+        let exported = ["caller_of_heavy", "memory_heavy_loop", "compute_heavy_loop"];
+
+        for address in 0..166 {
+            let stack = mapper.resolve(address);
+            let Some(outer) = stack.last() else { continue };
+
+            assert!(
+                exported.contains(&outer.function_name.as_str()),
+                "address {address} bottoms out in {:?}: {stack:?}",
+                outer.function_name
+            );
+        }
     }
 
     /// One frame measured out of a `debug = 2`, `opt-level = 1` `wasm32-unknown-unknown` build of a
@@ -1159,26 +1306,30 @@ mod tests {
         let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
 
         for address in 0..166 {
-            let Some(name) = mapper.resolve(address).map(|frame| frame.function_name) else {
-                continue;
-            };
-
-            assert_eq!(
-                collapse_closures(&name),
-                name,
-                "address {address} named {name:?} was rewritten"
-            );
+            for name in mapper
+                .resolve(address)
+                .into_iter()
+                .map(|frame| frame.function_name)
+            {
+                assert_eq!(
+                    collapse_closures(&name),
+                    name,
+                    "address {address} named {name:?} was rewritten"
+                );
+            }
         }
     }
 
     #[test]
     fn resolution_covers_most_of_the_code_section() {
         // Not "DWARF is present" but "DWARF maps an executed address": the fixture's code section
-        // is 165 bytes, and one address per byte is swept. 160 of those 166 resolve; the rest are
-        // the two-byte gaps between functions and the address past the end.
+        // is 165 bytes, and one address per byte is swept. 160 of those 166 resolve — and because
+        // 10 of them are inlined call sites, the stack they hand back is 170 frames long. The
+        // sweep is flat rather than one-frame-per-address so the names below include the inlined
+        // half of every stack, which is where a mangled symbol would actually leak through.
         let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
 
-        let frames: Vec<SourceFrame> = (0..166usize).filter_map(|pc| mapper.resolve(pc)).collect();
+        let frames: Vec<SourceFrame> = (0..166usize).flat_map(|pc| mapper.resolve(pc)).collect();
         let names: Vec<&str> = frames
             .iter()
             .map(|frame| frame.function_name.as_str())
@@ -1225,7 +1376,7 @@ mod tests {
             usize::MAX - 1,
             usize::MAX,
         ] {
-            assert_eq!(mapper.resolve(pc), None, "pc {pc} should not resolve");
+            assert!(mapper.resolve(pc).is_empty(), "pc {pc} should not resolve");
         }
     }
     #[test]
@@ -1235,7 +1386,7 @@ mod tests {
         assert!(!mapper.has_debug_info());
         for pc in [0usize, 1, 64, 4096, usize::MAX] {
             assert!(
-                mapper.resolve(pc).is_none(),
+                mapper.resolve(pc).is_empty(),
                 "pc {pc} resolved to a frame from a mapper with no symbols"
             );
         }
@@ -1275,7 +1426,7 @@ mod tests {
         // being self-consistent: `bodies` comes from the wasm framing and `resolve` comes from
         // DWARF, so they agree only if the translation base is exactly right. Move the base by one
         // byte and these addresses land on a size prefix or outside the section, and `resolve`
-        // answers `None` for all three.
+        // answers an empty stack for all three.
         let mapper = SourceMapper::new(DWARF_PROBE).expect("the fixture carries DWARF");
         let map = mapper.code_map().expect("the fixture has a code section");
         let base = 111; // the fixture's code section payload, measured from its section table
@@ -1284,8 +1435,9 @@ mod tests {
 
         let names = ["caller_of_heavy", "memory_heavy_loop", "compute_heavy_loop"];
         for (index, body) in map.bodies().iter().enumerate() {
-            let frame = mapper
-                .resolve_file_offset(base + body.start)
+            let stack = mapper.resolve_file_offset(base + body.start);
+            let frame = stack
+                .first()
                 .unwrap_or_else(|| panic!("offset {} is a function prologue", base + body.start));
             assert_eq!(frame.function_name, names[index]);
             assert_eq!(map.function_at(body.start), Some(index));
@@ -1326,13 +1478,13 @@ mod tests {
         // someone debugging the line table instead of their arithmetic.
         for offset in [0usize, 8, 10, 110, 276, 279, 1_000, 1_000_000, usize::MAX] {
             assert!(
-                mapper.resolve_file_offset(offset).is_none(),
+                mapper.resolve_file_offset(offset).is_empty(),
                 "file offset {offset} is outside the code section"
             );
         }
 
         // And the boundary the other way: the first offset inside it does resolve.
-        assert!(mapper.resolve_file_offset(113).is_some());
+        assert!(!mapper.resolve_file_offset(113).is_empty());
     }
 
     #[test]
@@ -1367,6 +1519,6 @@ mod tests {
         let mapper = SourceMapper::unmapped();
 
         assert!(mapper.code_map().is_none());
-        assert!(mapper.resolve_file_offset(113).is_none());
+        assert!(mapper.resolve_file_offset(113).is_empty());
     }
 }
