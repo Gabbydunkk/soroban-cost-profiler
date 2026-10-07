@@ -11,21 +11,19 @@
 //! 4. **Format** — serialize the tree as `.folded` collapsed stacks for external
 //!    viewers such as speedscope (`formatter`).
 //!
-//! Stages 2 and 3 are still scaffolds (Phase 3 and Phase 4 of `ROADMAP.md`), so the
-//! calls that depend on them are commented out rather than deleted: they document the
-//! intended call order, and uncommenting each line is the completion criterion for its
-//! phase. The `_`-prefixed bindings exist for the same reason — they keep the type
-//! plumbing compiling as an early warning when a stage's signature changes.
+//! Stage 2 is still a scaffold (Phase 3 of `ROADMAP.md`), so the mapper it builds resolves
+//! nothing and every frame reaches Stage 3 as an unresolved `wasm[pc]`. The four calls that hand
+//! data between stages are now live; what is still missing is real input, which Phase 5's CLI
+//! supplies.
 //!
-//! Each stage's construction lives in its own function so that wiring Phase 3 or Phase 4
-//! in is a one-line change at the call site, and so the placeholder input each stage needs
-//! today has a documented home instead of sitting inline in `main`.
+//! Each stage's construction lives in its own function so that wiring Phase 3 in is a one-line
+//! change at the call site, and so the placeholder input each stage needs today has a documented
+//! home instead of sitting inline in `main`.
 //!
 //! [`TraceEvent`]: soroban_cost_profiler::models::TraceEvent
 //! [`CallStackNode`]: soroban_cost_profiler::models::CallStackNode
 use soroban_cost_profiler::aggregator::ProfileAggregator;
-// Stage 4 waits on Stage 3: uncomment once `aggregate()` returns a tree.
-// use soroban_cost_profiler::formatter::OutputFormatter;
+use soroban_cost_profiler::formatter::OutputFormatter;
 use soroban_cost_profiler::source_map::SourceMapper;
 use soroban_cost_profiler::tracer::ExecutionTracer;
 
@@ -50,26 +48,26 @@ fn initialize_aggregator() -> ProfileAggregator {
     ProfileAggregator::new()
 }
 
-/// Run the pipeline stages that exist today.
+/// Run the whole pipeline over an empty trace and return the folded stacks it produces.
 ///
-/// Currently a dry harness: it assembles each stage with placeholder input and exercises no
-/// WASM. It takes no CLI arguments yet — flag parsing (`--wasm`, `--output`) is Phase 5 —
-/// so the calls that would move data between stages stay commented out as their phases'
-/// completion criteria.
-fn profile() {
+/// All four stages are now wired in call order, but it is still a dry harness: no WASM is
+/// executed, so the tracer flushes nothing and the result is one zero-cost frame. Flag parsing
+/// (`--wasm`, `--output`) is Phase 5, which replaces the empty trace with a real run and writes
+/// this return value to disk.
+fn profile() -> String {
     // 1. Initialize tracer and execute WASM
-    let mut _tracer = initialize_tracer();
-    // let _events = _tracer.flush_trace();
+    let mut tracer = initialize_tracer();
+    let events = tracer.flush_trace();
 
     // 2. Load DWARF source map
-    let _mapper = load_source_mapper();
+    let mapper = load_source_mapper();
 
     // 3. Aggregate events into call tree
-    let mut _aggregator = initialize_aggregator();
-    // let _call_tree = _aggregator.aggregate(_events, &_mapper);
+    let mut aggregator = initialize_aggregator();
+    let call_tree = aggregator.aggregate(events, &mapper);
 
     // 4. Format and output
-    // let _collapsed_stack = OutputFormatter::to_collapsed_stack(&_call_tree);
+    OutputFormatter::to_collapsed_stack(&call_tree)
 }
 
 /// Print the MVP notice and run the harness.
@@ -80,14 +78,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::profile;
+    use super::*;
 
-    /// The harness has no observable output yet, so the bar is that assembling the stages in
-    /// the documented order runs to completion. This is the first test to execute `main`'s
-    /// code at all: `cargo test` never calls `main`, so before this the binary target had no
-    /// coverage whatsoever.
+    /// The harness has no WASM to run yet, so the bar is that the stages hand data to each other
+    /// in the documented order and the last one produces a parseable folded stack. An empty trace
+    /// is legal input for the whole pipeline: it ends as one zero-cost, unresolved frame.
     #[test]
     fn assembling_the_stages_runs_to_completion() {
-        profile();
+        let collapsed = profile();
+
+        let stacks = OutputFormatter::parse_folded(&collapsed)
+            .expect("the pipeline's own output must be valid folded stacks");
+        assert_eq!(
+            stacks.values().sum::<u64>(),
+            0,
+            "no WASM ran, so nothing was costed"
+        );
     }
 }

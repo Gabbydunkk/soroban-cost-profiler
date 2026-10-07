@@ -3,8 +3,13 @@
 //! `tests/meter_probe.rs` drives the engine hooks by running WASM. This file covers the
 //! entry points that run *around* a trace — module and file loading, engine setup, and the
 //! tracer's sampling and ceiling knobs — where a mistake currently surfaces as a panic in CI
-//! or as a silently empty trace rather than as a test failure.
+//! or as a silently empty trace rather than as a test failure. The last test hands a trace
+//! through every stage at once, which is the only place the stages' shared types are checked
+//! against each other rather than against a unit test's assumption.
 
+use soroban_cost_profiler::aggregator::ProfileAggregator;
+use soroban_cost_profiler::formatter::OutputFormatter;
+use soroban_cost_profiler::source_map::SourceMapper;
 use soroban_cost_profiler::tracer::{
     ExecutionTracer, ProfilerState, instantiate_module, load_wasm_file, parse_module, setup_engine,
     setup_mock_env,
@@ -204,5 +209,45 @@ fn step_costs_accumulate_across_samples_instead_of_being_dropped() {
         tracer.flush_trace()[0].cpu_cost,
         100,
         "the two steps after the reset should cross together"
+    );
+}
+
+/// Stage 1 → 3 → 4, with nothing stubbed between them.
+///
+/// Each stage's unit tests hand it input in the shape it expects; this pins that the shapes
+/// actually agree, which is where a pipeline breaks silently — a tree the formatter cannot walk,
+/// or events the aggregator reads as a different boundary kind, both cost nothing and report
+/// nothing.
+#[test]
+fn a_traced_run_reaches_the_viewer_as_folded_stacks() {
+    let mut tracer = ExecutionTracer::new().with_sample_rate(1);
+    tracer.record_call(0, 0, 0);
+    let _ = tracer.record_step(0, 40, 7);
+    // A nested call: the engine reports no inner boundaries and no program counters, so this is
+    // what every real contract trace looks like today.
+    tracer.record_call(0, 0, 0);
+    let _ = tracer.record_step(0, 60, 3);
+    tracer.record_return(0, 0, 0);
+    tracer.record_return(0, 0, 0);
+
+    let events = tracer.flush_trace();
+    let mut aggregator = ProfileAggregator::new();
+    let tree = aggregator.aggregate(events, &SourceMapper::new(&[]));
+    let folded = OutputFormatter::to_collapsed_stack(&tree);
+
+    // Asserted through the parser rather than as a string: `CallStackNode`'s children are a
+    // `HashMap`, so line order is not stable across runs.
+    let stacks = OutputFormatter::parse_folded(&folded)
+        .unwrap_or_else(|error| panic!("the pipeline emitted unreadable stacks: {error}"));
+
+    assert_eq!(
+        stacks.len(),
+        1,
+        "unresolved boundaries all fold into one frame, got: {stacks:?}"
+    );
+    assert_eq!(
+        stacks.values().sum::<u64>(),
+        100,
+        "the whole traced cost survives the trip through the pipeline"
     );
 }
