@@ -79,7 +79,7 @@ soroban-cost-profiler compare before.folded after.folded
 | `--fn <EXPORT>` | — | The exported function to invoke. Profiling refuses to start without a name, and a name the module does not export is an error that lists the exports it does have. |
 | `-o, --output <PATH>` | `profile.folded` | Where the collapsed stacks are written. |
 | `--metric <METRIC>` | `cpu` | `cpu`, `memory` or `hostcalls`. Sets what the counts in the file are denominated in; a `.folded` file does not record which, so both sides of a `compare` must have agreed on this flag beforehand. |
-| `--sample-rate <N>` | `1000` | Record one trace event every N instructions. Smaller is a denser trace and a bigger file; `0` is rejected, because it would silently turn sampling off and buffer every instruction. |
+| `--sample-rate <N>` | `1000` | Record one trace event every N traced steps; `0` is rejected, because it would silently turn sampling off and buffer every step. Today the engine reports one step per call boundary, so this flag changes *when* events are emitted rather than what they measure — see [Limitations](#the-counts-are-boundary-counts-not-instructions). |
 | `compare <BASE> <CURRENT>` | — | The second mode: reads two `.folded` files, prints the functions whose cost moved, biggest move first. |
 
 `--help` prints these with their long-form notes and the exit-code table; `-h` is the short version;
@@ -197,8 +197,9 @@ cargo build --profile profiling --target wasm32-unknown-unknown
 > [!WARNING]
 > **Two caveats:**
 > 1. **Downstream stripping:** if you use `stellar contract build` instead of `cargo build`, downstream tools
->    (like `wasm-opt`) may still strip debug sections regardless of your `Cargo.toml`. We are actively
->    investigating reliable CLI flags.
+>    (like `wasm-opt`) may still strip debug sections regardless of your `Cargo.toml`. Both halves of that
+>    sentence — what survives, and what survives *broken* — are measured in
+>    [Limitations](#the-build-pipeline-can-leave-the-binary-unmappable-and-say-nothing).
 > 2. **Inlining (LTO):** preserving line tables does *not* stop the compiler from inlining aggressively. A
 >    heavily optimized loop can map to one line, which is correct but coarser than you expected.
 
@@ -208,6 +209,152 @@ cargo build --profile profiling --target wasm32-unknown-unknown
 > `failed to instantiate module: cannot find definition for import …` before its export is called. Pure
 > computation exports profile today; wiring the host bindings is
 > [#210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210).
+
+## Limitations
+
+The pipeline is complete and tested — load, trace, symbolize, aggregate, format, diff — and the ceiling is
+at its *input*: `wasmi` 2.0 exposes no instruction-level hook, so what the tracer can see is a list of call
+boundaries rather than the instructions between them. Every limitation below is either a consequence of that
+or a measured property of the build pipeline, and each names what would lift it. Read this before you read a
+number out of a `.folded` file.
+
+### The counts are boundary counts, not instructions
+
+The same contract, the same build, twice — the second with the sample rate forced down to one:
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy
+no function recorded any exclusive cost (cpu)
+$ cat profile.folded
+wasm[0] 0
+
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy --sample-rate 1
+Top 1 functions by exclusive cost (cpu):
+  1. wasm[0]  2
+$ cat profile.folded
+wasm[0] 2
+```
+
+That `2` is not a measurement of work. It is the number of boundaries the engine reported for one
+host-initiated call — `CallingWasm` and `ReturningFromWasm` — each charged one synthetic unit, because
+`invoke_function`'s hook has no instruction hook to hang a real count on and substitutes one step per
+boundary (`src/tracer.rs:352-356`). At the default `--sample-rate 1000` the accumulator gains 1 per boundary
+and so never reaches the threshold, which is why the first run writes `0` rather than a small number.
+
+Consequences worth stating plainly:
+
+* `--metric cpu`, `--metric memory` and `--metric hostcalls` all produced `wasm[0] 0` for that run, measured
+  on the same binary. Memory bytes and host-call counts reach the tree only through host frames — the budget
+  deltas read around a host call (`record_host_return`, `src/tracer.rs:172-187`) and the `HostCall` events
+  that open them — and no host frame can open while nothing links a host function. So until
+  [#210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210) lands, those two metrics are
+  structurally empty rather than merely small.
+* The numbers are a **floor and a shape**, not a budget reading. Use `soroban-budget-assert` (Tier 2) for the
+  instructions the network will actually charge you; this profiler is for *where* to look.
+* Nothing here is invented to look better: `wasm[0] 0` is what the Getting Started transcript shows, and a
+  test pins that exact string so PC attribution cannot land as a silent change (`tests/cli_e2e.rs`).
+
+### Every frame lands at `wasm[0]`
+
+The call hook is handed the hook *variant* and nothing else — no callee, no offset — so all events are
+recorded at `pc = 0` (`src/tracer.rs:306-313`). And an internal instruction pointer would not fix it either:
+`wasmi` re-encodes wasm bytecode into its own instruction stream during translation and keeps no table back
+to the original offsets, so the finest address any future hook could hand this profiler is a function body's
+start.
+
+This is the reason source mapping exists as a separate, complete stage rather than a nice-to-have:
+`CodeMap` indexes exactly that body-start space, and `tests/source_map_fixture.rs` checks resolved addresses
+against the *text* of the source they came from. When an address reaches a frame, the `file:line` half is
+already built and correct; today the trace never asks for anything but `0`.
+
+### Only the outer call is traced
+
+`Store::call_hook` fires for the host-initiated call into wasm, not for calls made from inside running wasm.
+A contract whose entry point calls five helpers yields one `Call`/`Return` pair, not six, so the call tree
+the aggregator rebuilds is one level deep no matter how deep the contract goes. The probe
+`only_the_outer_invocation_is_recorded_as_a_boundary` in `tests/meter_probe.rs` pins it, and the doc block on
+`invoke_function` (`src/tracer.rs:289-322`) records both the limitation and what to change rather than delete
+when a per-call hook exists. `docs/internals/call_boundaries.md` describes the two boundary *types* the trace
+does distinguish — wasm calls and host transitions.
+
+### Contracts that import the Soroban host do not run
+
+Linked to the empty `Linker` (`src/tracer.rs:171`), this is the blocker the IMPORTANT note above points at,
+and it has two neighbours of the same kind, both measured on the built binary:
+
+* **No arguments are passed.** The export is invoked with an empty parameter list, so a contract export that
+  takes arguments ends the run before it starts. Against a 43-byte `(func (export "needs_arg") (param i64)
+  (result i64))` module — whose no-debug warning is elided here, since the interesting half is the exit code:
+
+  ```console
+  $ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --output out.folded
+  error: 'needs_arg' trapped: encountered an incorrect number of parameters. The partial trace up to the
+  trap is in out.folded, and its costs are incomplete because the call never returned.
+  $ echo $?
+  1
+  ```
+
+  Passing values is [`--args` (issue 211)](https://github.com/Tollcraft/soroban-cost-profiler/issues/211).
+* **No ledger state.** There is no `--state`, no network and no snapshot, so anything reading storage has
+  nothing to read — [issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212).
+
+One export per run is by design rather than a gap: a trace of a whole transaction is a different artifact
+from a profile of a function, and the file format already supports the nested case.
+
+### The build pipeline can leave the binary unmappable and say nothing
+
+The `debug` precondition above is the *easy* case: no line tables, an error fires, you are told. The hard
+case is a binary whose DWARF loads and is wrong. Measured in
+[`docs/spikes/02_wasm_name_section_fallback.md`](docs/spikes/02_wasm_name_section_fallback.md), on the
+committed `dwarf_probe.wasm`:
+
+| Applied to the artifact | `.debug_*` | `name` | Addresses that resolve |
+|---|---|---|---|
+| nothing (as built) | 1,002 B | present | 160 of 166 probed |
+| `wasm-opt -O0` | 855 B, **stale** | **gone** | **0 of 152** |
+| `wasm-opt -Oz` | 855 B, **stale** | **gone** | **0 of 145** |
+| `wasm-opt -Oz -g` | 1,098 B | present | 140 of 145 |
+| `wasm-opt --strip-dwarf` | none | gone | not applicable |
+
+`SourceMapper::new` finds `.debug_info` after `wasm-opt`, gimli parses it, `has_debug_info()` returns `true`,
+and **every lookup returns nothing** — the line table describes the pre-optimization code section the
+optimizer rewrote. No error fires, because there is nothing structurally wrong to fire on. The defence is
+[#162](https://github.com/Tollcraft/soroban-cost-profiler/issues/162)'s ratio check: every tenth address of
+the code section is sampled, and if more than 90% of them map to no line or to a line another address already
+claimed, the run warns that the DWARF describes different code from the bytes that ran. It is the only signal
+for this case, so a run that warns about *coverage* is not broken — it is telling you the artifact is.
+
+In short: build the profiling profile yourself with `cargo build --profile profiling`, and if you must run
+Binaryen, pass `-g`. `stellar contract optimize` passes no `-g` today, so its output is unmappable by either
+source. Two smaller edges from the same measurement: `--strip-debug`/`--strip-dwarf` drop DWARF *and* the
+`name` fallback together, so "just strip it" recipes lose both; and the paths in the tables are the absolute
+ones from whatever machine ran `rustc`, which is why file matching in the tests is by suffix.
+
+### The 100M ceiling cannot see an infinite loop
+
+The MVP's memory rule (`AGENTS.md` rule 5: a contract can run 100M instructions, so nothing may allocate
+per instruction) is why a 100M ceiling exists, and `record_step` enforces it (`src/tracer.rs:93`). But its
+only caller in the live path is the call hook, which runs once per boundary —
+so the counter advances per boundary, not per instruction. A contract that loops forever *inside* one
+function body emits no boundaries, never advances the counter, and is not stopped; `wasmi`'s own fuel is set
+to `u64::MAX` for the run (`src/main.rs:348-350`), so the engine does not stop it either.
+
+This is the sharpest edge in the tool, and it is the one place where the roadmap's
+"Infinite Loop Protection" box reads more strongly than the current engine can deliver — `ROADMAP.md` now
+annotates it. The guard is real for the tracing buffer it was written to protect (a run with many boundaries
+cannot grow the `Vec` unboundedly) and inert against a compute-only runaway loop. A ceiling that also halts
+execution needs the instruction hook, and
+[issue 213](https://github.com/Tollcraft/soroban-cost-profiler/issues/213) makes its limit configurable once
+there is something for it to bound. Until then: profile exports that terminate, and prefer the fixture-sized
+contracts this repository tests against.
+
+### What is *not* a limitation
+
+No macros, no test hooks, no recompiled-with-instrumentation source — a standard `cargo build --profile
+profiling` artifact is enough, which is the whole point of the zero-instrumentation rule. Output is plain
+collapsed-stack text that [speedscope.app](https://www.speedscope.app) opens and `flamegraph.pl` pictures;
+no SVG renderer is bundled and none is promised. Exit codes are the documented `0`/`1`/`2`, a trap writes
+the partial trace it earned, and `compare` reports a regression as an answer rather than a failure.
 
 ## Contributing
 
