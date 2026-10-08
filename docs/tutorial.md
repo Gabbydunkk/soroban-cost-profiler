@@ -61,9 +61,10 @@ counter to look a line up with. What the tables buy you is (a) the warnings belo
 of your artifact is missing, and (b) the source-mapping stage being already built and correct underneath — so
 the frame names land the moment PC attribution does, rather than a second build being required then.
 
-Now a contract. Two things make the difference in this tutorial: the exports take **no arguments**, and the
-crate builds for wasm. This one is deliberately small — three functions, two loops and a wrapper that calls
-both, which is enough to have a shape worth looking at:
+Now a contract. Two things make the difference in this tutorial: the exports take **no arguments**, so step
+3's command line has nothing to get wrong (an export that does take them is profiled the same way, with
+`--args 1000,7`), and the crate builds for wasm. This one is deliberately small — three functions, two loops
+and a wrapper that calls both, which is enough to have a shape worth looking at:
 
 ```rust
 #![no_std]
@@ -118,10 +119,11 @@ out at 714 bytes — the 768-byte difference *is* the debug info, which is the r
 deployed profile. You do not have to check any of this by hand: step 3 tells you out loud if a half is
 missing.
 
-> **Why no arguments?** The profiler invokes the export with an empty parameter list, so an export that takes
-> arguments traps before it runs. This is a known ceiling, not a mistake in your contract, and it is why a
-> real `soroban-sdk` build's `call` entry — which takes three — cannot be profiled by name yet. Step 6 shows
-> what that looks like when you try.
+> **Why no arguments?** To keep step 3 one command long. An export that declares parameters is profiled the
+> same way with `--args 1000,7` added, and the profiler checks that list against the module's own signature
+> before it calls anything, so a wrong count is a refused command line rather than a trap. What no command
+> line can supply is a real `soroban-sdk` build's environment and object handles — and an argument is
+> irrelevant to a module that cannot link. Step 6 shows what that looks like when you try.
 
 ## 3. Profile one export
 
@@ -261,13 +263,14 @@ Exit `1`, and **no `.folded` file**, because nothing ran. A `soroban-sdk` build 
 environment interface — here the module `i`, function `_`, taking and returning an `I64` — and this profiler
 links against an empty linker, so the module never instantiates. That is
 [issue 210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210), the single blocker between this
-tutorial and a version of it that profiles your actual contract. Two neighbours of the same kind are
-[`--args`, issue 211](https://github.com/Tollcraft/soroban-cost-profiler/issues/211) for exports that take
-arguments and [issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212) for ledger state.
+tutorial and a version of it that profiles your actual contract. Reading ledger state is the other half of
+that gap — [issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212). Taking arguments is
+not: `--args 1000,7` passes `i64` values to an export that declares parameters, and
+[the troubleshooting entry](troubleshooting.md#the-export-takes-arguments) shows both the refusal you get for
+the wrong count and the width a command line cannot name.
 
 So for now, the contracts that profile are the pure-computation ones: the loops, parsers and arithmetic your
-contract is built out of, exported without arguments — which is exactly why steps 2 and 3 used a contract with
-no SDK dependency.
+contract is built out of — which is exactly why steps 2 and 3 used a contract with no SDK dependency.
 
 ## 7. Did my change help?
 
