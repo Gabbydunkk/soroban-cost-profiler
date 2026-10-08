@@ -33,6 +33,8 @@ from any command line:
 | `failed to instantiate module: cannot find definition for import` | A real `soroban-sdk` contract; blocked on #210 | [Host imports](#a-contract-that-imports-host-functions-does-not-run) |
 | `trapped: encountered an incorrect number of parameters` | The export takes arguments; blocked on #211 | [Arguments](#the-export-takes-arguments) |
 | `Instruction ceiling exceeded` | The trace-buffer guard tripped at your `--instruction-limit` | [The ceiling](#about-the-100m-instruction-limit) |
+| No records on stderr when you want them | The default level prints none; `-v` installs the transcript | [What the profiler is doing](#i-want-to-see-what-the-profiler-is-doing) |
+| `--quiet` prints nothing on stdout and exits `0` | The flag's whole job: the artifact is the answer | [`--quiet`](#--quiet-printed-nothing-is-that-a-failure) |
 | `error: … (os error 2)` and friends | Bad path, bad file, bad flag | [Exit codes](#exit-codes-1-and-2) |
 
 ## The profile is one line of zeros
@@ -45,7 +47,7 @@ wasm[0] 0
 ```
 
 **Why.** `invoke_function`'s hook has no instruction hook to hang a count on, so it substitutes one
-unit-costed step per boundary (`src/tracer.rs:352-356`). `caller_of_heavy` crosses two boundaries — the call
+unit-costed step per boundary (`src/tracer.rs:356-360`). `caller_of_heavy` crosses two boundaries — the call
 in and the return out — and at the default `--sample-rate 1000` the accumulator gains 1 per boundary, so it
 never reaches the threshold that emits an event. The zero is structural, not a small measurement.
 
@@ -73,7 +75,7 @@ no function recorded any exclusive cost (hostcalls)
 ```
 
 that is not three separate failures. Memory bytes and host-call counts reach the call tree only through host
-frames: the budget deltas read around a call (`record_host_return`, `src/tracer.rs:172-187`) and the
+frames: the budget deltas read around a call (`record_host_return`, `src/tracer.rs:176-191`) and the
 `HostCall` events that open them. No host frame can open while nothing links a host function
 ([#210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210)), so those two metrics are
 structurally empty today rather than merely small.
@@ -199,7 +201,7 @@ $ ls boom.folded
 ls: boom.folded: No such file or directory
 ```
 
-**Why.** `instantiate_module` links against an empty `wasmi::Linker` (`src/tracer.rs:285`), so a module
+**Why.** `instantiate_module` links against an empty `wasmi::Linker` (`src/tracer.rs:289`), so a module
 importing the Soroban environment interface fails to link before its export is called. This is what a real
 `soroban-sdk` build does — its contract imports the host — which is why the README carries the same warning
 in an `IMPORTANT` note.
@@ -272,7 +274,7 @@ rebuild it.
 ## The output path is wrong, and which exit code it earns
 
 Exit codes are the documented `0` success, `1` "the invocation could not be honoured as asked", `2` "the
-input was accepted and the profiler could not finish its own work" (`src/main.rs:463-477` splits these two on
+input was accepted and the profiler could not finish its own work" (`src/main.rs:482-496` splits these two on
 the error kind, so a path you could never have written to is `1` and a machine refusing a write is `2`):
 
 ```console
@@ -311,6 +313,9 @@ error: invalid value 'gas' for '--metric <METRIC>'
 
 $ soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 0
 error: invalid value '0' for '--instruction-limit <INSTRUCTION_LIMIT>': must be greater than 0
+
+$ soroban-cost-profiler --wasm contract.wasm --fn call -v --quiet
+error: the argument '--verbose...' cannot be used with '--quiet'
 $ echo $?
 1
 ```
@@ -323,6 +328,56 @@ For `--instruction-limit` the comparison runs the other way: the counter increme
 so a ceiling of `0` fails the first boundary and the run ends having profiled nothing, which looks exactly
 like a contract that traps on its first instruction. Refusing both at the flag means the run never starts
 instead of dying later with no explanation.
+
+`-v` and `--quiet` are refused as a pair for a third reason: they state opposite intentions about the same
+output, and clap picking a winner would leave the user reading a transcript their own command line did not
+ask for.
+
+## I want to see what the profiler is doing
+
+```console
+$ soroban-cost-profiler --wasm contract.wasm --fn call -v 2>&1 >/dev/null
+2026-10-08T06:05:58.562669Z  INFO soroban_cost_profiler::tracer: Loading WASM file from contract.wasm
+2026-10-08T06:05:58.562988Z  INFO instantiate_module: soroban_cost_profiler::tracer: Instantiating WASM module
+2026-10-08T06:05:58.569862Z  INFO invoke_function{func_name="call"}: soroban_cost_profiler::tracer: Invoking function: call
+```
+
+**What to do.** Nothing is wrong; `-v` is the flag. The default level is `WARN` and the crate keeps no
+`warn!` or `error!` record — every message meant for a user leaves through `warning:`/`error:` on stderr,
+independently of any flag — so a plain run is silent by design. A run that prints no records *and* no
+`error:` line succeeded; check the artifact before concluding the profiler did nothing.
+
+The notches step through what the engine can report, and the last two are the interesting ones for the
+symptoms elsewhere on this page:
+
+- `-v` (`INFO`) — the three stages: load, instantiate, invoke. A run that stops after the first line never
+  found a readable module; after the second, it found one that would not link (see
+  [A contract that imports host functions does not run](#a-contract-that-imports-host-functions-does-not-run)).
+- `-vv` (`DEBUG`) — every call boundary the engine reports, as `WASM Call at PC: 0` / `WASM Return at PC: 0`.
+  Count them: a contract that calls five helpers and reports two boundaries is
+  [the profile that is one line of zeros](#the-profile-is-one-line-of-zeros), and the count is the evidence
+  that the engine, not your contract, is the one hiding the calls.
+- `-vvv` (`TRACE`) — the single costed step recorded at each boundary (`Stepping at PC: 0, cpu: 1, mem: 0`),
+  which is `wasmi` 2.0's substitute for an instruction hook.
+
+The transcript is stderr, timestamped in UTC, and carries no ANSI escapes, so `2>&1 >/dev/null` and
+`grep -c 'WASM Call'` both work on it. Records never reach stdout: that stream is the summary callers pipe.
+
+## `--quiet` printed nothing, is that a failure?
+
+```console
+$ soroban-cost-profiler --wasm contract.wasm --fn call --quiet
+$ echo $?
+0
+$ cat profile.folded
+wasm[0] 0
+```
+
+It is the flag's whole job: stdout is narration, and `--quiet` says the file is the answer. Exit `0`, empty
+stdout, the artifact unchanged from a loud run byte-for-byte. What it does *not* suppress is the other two
+kinds of output — a `warning:` about a binary it could not symbolize and an `error:` about a run that could
+not happen still print, because those are news about your command rather than commentary on the profiler's
+day, and `compare`'s table stays too, since for that mode the table is the answer and not an echo.
 
 ## `compare` complains
 
@@ -354,7 +409,7 @@ exits are `0`.
 ## About the 100M instruction limit
 
 The MVP constraint (`AGENTS.md` rule 5: a contract can run 100M instructions, so nothing may allocate per
-instruction) is enforced as `instruction_ceiling` inside `record_step` (`src/tracer.rs:93-95`), whose error
+instruction) is enforced as `instruction_ceiling` inside `record_step` (`src/tracer.rs:97-99`), whose error
 text is `Instruction ceiling exceeded`. The bound is a flag — `--instruction-limit`, from
 [issue 213](https://github.com/Tollcraft/soroban-cost-profiler/issues/213) — so unlike every other ceiling in
 this file, this one you can move. When it fires it reaches you through the trap path, so the message has the
@@ -378,10 +433,10 @@ does not say, and a reader should know before trusting it:
   reports `ReturningFromWasm`. Only the exit code and this message separate the two, so never read the
   artifact alone as "the call finished".
 * **The counter counts boundaries, not instructions.** Its only caller in the live path is the call hook,
-  which runs once per boundary (`src/tracer.rs:352-356`), and one host-initiated call gives two of them —
+  which runs once per boundary (`src/tracer.rs:356-360`), and one host-initiated call gives two of them —
   which is why `1` halts a function that computes a million instructions and `2` lets it finish. A contract
   that loops forever *inside* one function body emits no boundaries, never advances the counter, and is not
-  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:385-387`), so the engine
+  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:404-406`), so the engine
   does not stop it either.
 
 So if your symptom is "it hangs" or "my machine ran out of memory", the ceiling message is not the diagnosis,

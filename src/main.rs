@@ -33,6 +33,7 @@ use soroban_cost_profiler::tracer::{
 };
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use tracing::level_filters::LevelFilter;
 use wasmi::{ExternType, Val};
 
 /// `value_parser` for `--sample-rate`: accept a positive count, refuse everything else.
@@ -149,6 +150,23 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = Metric::Cpu)]
     pub metric: Metric,
 
+    /// Print the profiler's internal progress on stderr: `-v` stages, `-vv` every call boundary,
+    /// `-vvv` every costed step
+    //
+    // A count, so `-vv` and `-vvv` are one flag rather than three. `conflicts_with` is for the
+    // ambiguity, not the arithmetic: `-v --quiet` asks for more and less output at once, and a tool
+    // that picked a winner silently would be guessing at a command line it cannot honour.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    pub verbose: u8,
+
+    /// Write the `.folded` artifact and print nothing on stdout
+    ///
+    /// What is kept, deliberately: the artifact, every `warning:` line about a degraded run, and
+    /// every fatal `error:` — quiet means "do not narrate", not "do not report". `compare`'s table
+    /// is that mode's whole answer rather than an echo of a file, so it still prints.
+    #[arg(short = 'q', long = "quiet")]
+    pub quiet: bool,
+
     /// Mode to run instead of profiling: see [`Command`]
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -193,9 +211,10 @@ fn initialize_tracer(cli: &Cli) -> ExecutionTracer {
 /// Print a degraded-profile warning where the user will actually read it (#186).
 ///
 /// stderr, for two reasons that both bite here: stdout carries the ranked summary that callers pipe
-/// into other tools, and nothing in this crate installs a `tracing` subscriber — so the
-/// `tracing::warn!` this stage used to write its warning with produced no output at all, which is
-/// how a profiler running on a stripped binary could claim to have warned the user about it.
+/// into other tools, and the `tracing::warn!` this stage used to write its warning with produced no
+/// output at all — the crate installed no subscriber until #214, which is how a profiler running on
+/// a stripped binary could claim to have warned the user about it. `warn_user` is also what keeps
+/// the sentence independent of `-v`: a user-facing warning must not depend on a verbosity flag.
 fn warn_user(message: &str) {
     eprintln!("warning: {message}");
 }
@@ -485,6 +504,14 @@ fn profile(cli: &Cli) -> Result<(), Failure> {
         )));
     }
 
+    // `--quiet` means "the artifact is the answer" (#214). The summary is a glance at numbers the
+    // file already carries, so a caller who asked for silence gets the file and an empty stdout;
+    // the warnings and errors above this line are their own sites' output and stay, because quiet
+    // is about narration and not about news.
+    if cli.quiet {
+        return Ok(());
+    }
+
     let ranked = OutputFormatter::top_functions(&call_tree, &cli.metric, TOP_FUNCTIONS);
     println!(
         "{}",
@@ -558,11 +585,57 @@ fn clap_exit_code(error: &clap::Error) -> i32 {
     }
 }
 
+/// The `tracing` level the verbosity flags select (#214).
+///
+/// The default is `WARN`, and the honest description of that setting is *silent*: after #198 and
+/// #186 every message a user is meant to read leaves through `warn_user` or `main`'s `eprintln!`,
+/// and the crate has no `warn!` or `error!` record left. That is the point — a subscriber that
+/// prints the profiler's module paths over the top of the sentences it already chose would be a
+/// regression, which is why the three remaining fatal-path `error!` sites in `tracer.rs` are
+/// `debug!` here rather than a second copy of the CLI's text.
+///
+/// The steps up are what makes the ten-odd internal records this crate has ever written reachable:
+/// `INFO` names the stages a run passes through, `DEBUG` adds every call boundary the engine
+/// reports, `TRACE` adds the costed step recorded at each one. `--quiet` is the single notch below
+/// the default, and `main` gives it the conventional Unix second meaning — see [`Cli::quiet`].
+fn log_level(quiet: bool, verbosity: u8) -> LevelFilter {
+    if quiet {
+        LevelFilter::ERROR
+    } else {
+        match verbosity {
+            0 => LevelFilter::WARN,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        }
+    }
+}
+
+/// Install the subscriber this crate's `tracing` calls have been writing into since they were
+/// written (#214), before the first stage runs.
+///
+/// stderr, and that is the load-bearing part: stdout is a contract here. The `.folded` artifact is
+/// a file, but the ranked summary is a stream callers pipe, and #184's tests and
+/// `docs/troubleshooting.md` both rest on the two staying separate — a subscriber writing records
+/// to stdout would break them silently, on the runs that use `-v` and nothing else.
+///
+/// No `env_filter`: the level comes from argv, so `RUST_LOG` cannot change what a CI run prints
+/// behind a reviewer's back, and the `matchers`/`regex-automata` machinery it would pull in buys
+/// nothing a `-v` count does not already cover.
+fn init_logging(cli: &Cli) {
+    tracing_subscriber::fmt()
+        .with_max_level(log_level(cli.quiet, cli.verbose))
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 /// Run the pipeline, reporting any failure on stderr and exiting with the code its kind maps to.
 ///
-/// Every message goes through `eprintln!` rather than `tracing` because nothing in this crate
-/// installs a subscriber: a `tracing::error!` on a fatal path writes nowhere, which is how a CLI
-/// that had never run its WASM still managed to print a plausible-looking empty profile.
+/// Every message goes through `eprintln!` rather than `tracing` because a `tracing::error!` needs a
+/// subscriber to reach anyone, and for the whole of this crate's history until #214 there was none —
+/// which is how a CLI that had never run its WASM still managed to print a plausible-looking empty
+/// profile. `init_logging` now installs one, at a level chosen so the two channels stay disjoint:
+/// records are what `-v` asks for, `error:` lines are what a failure always says.
 ///
 /// Two exit codes, one message shape. A bad invocation — unreadable contract, unknown export, a
 /// contract that trapped, an unreadable or malformed `.folded` file — is `1`; a profiler that could
@@ -578,6 +651,10 @@ fn main() {
             std::process::exit(clap_exit_code(&error));
         }
     };
+    // Installed after parsing and before anything logs: a record emitted while `Cli::try_parse`
+    // was still running would go to whatever level the *previous* command line asked for, and a
+    // record emitted before `init_logging` goes nowhere at all — which is the bug #214 is about.
+    init_logging(&cli);
     if let Err(failure) = run(&cli) {
         eprintln!("error: {}", failure.message());
         std::process::exit(failure.code());
@@ -610,6 +687,8 @@ mod tests {
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
+            verbose: 0,
+            quiet: false,
             command: None,
         }
     }
@@ -623,6 +702,8 @@ mod tests {
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
+            verbose: 0,
+            quiet: false,
             command: Some(Command::Compare { baseline, current }),
         }
     }
@@ -1379,5 +1460,129 @@ mod tests {
             deltas.iter().all(|delta| delta.delta() == 0),
             "two identical runs must report no moves: {deltas:?}"
         );
+    }
+
+    /// #214's first half: the flags exist and carry what the user typed. `-v` is a *count*, so
+    /// `-vvv` is one argument repeated rather than three flags, and the honest reading of the
+    /// default is that nothing was asked for — `verbose: 0`, `quiet: false`.
+    #[test]
+    fn the_verbosity_flags_reach_the_cli_as_a_count_and_a_switch() {
+        assert_eq!(
+            parse(&[]).unwrap().verbose,
+            0,
+            "the default narrates nothing"
+        );
+        assert!(!parse(&[]).unwrap().quiet);
+        assert_eq!(parse(&["-v"]).unwrap().verbose, 1);
+        assert_eq!(
+            parse(&["--verbose", "--verbose"]).unwrap().verbose,
+            2,
+            "the long form counts too, so a script can spell it out"
+        );
+        assert_eq!(parse(&["-vvv"]).unwrap().verbose, 3);
+        assert!(parse(&["--quiet"]).unwrap().quiet);
+        assert!(parse(&["-q"]).unwrap().quiet);
+    }
+
+    /// The mapping the doc comments and the README both describe, asserted as a table because the
+    /// two ends of it are load-bearing: `WARN` is the default precisely so a plain run prints no
+    /// records at all, and a `u8` count has to top out at `TRACE` rather than overflow or wrap.
+    #[test]
+    fn each_verbosity_notch_selects_the_documented_level() {
+        for (verbosity, level) in [
+            (0, LevelFilter::WARN),
+            (1, LevelFilter::INFO),
+            (2, LevelFilter::DEBUG),
+            (3, LevelFilter::TRACE),
+        ] {
+            assert_eq!(
+                log_level(false, verbosity),
+                level,
+                "the {verbosity}-`v` notch must select {level}"
+            );
+        }
+        assert_eq!(
+            log_level(false, 99),
+            LevelFilter::TRACE,
+            "past the deepest notch the count saturates the meaning, not the level"
+        );
+        assert_eq!(log_level(true, 0), LevelFilter::ERROR);
+    }
+
+    /// `-v --quiet` states two intentions about output at once, and clap refuses rather than
+    /// picking: a tool that silently won the argument would leave the user reading a transcript
+    /// that their own command line did not ask for. Same rule as `--wasm` beside `compare`.
+    #[test]
+    fn verbose_and_quiet_are_refused_together() {
+        let error = parse(&["-v", "--quiet"]).unwrap_err();
+        assert!(
+            error.contains("--verbose") && error.contains("--quiet"),
+            "the refusal must name both flags the user typed: {error}"
+        );
+    }
+
+    /// `--quiet` is a suppression of narration, not of the run: the artifact is the answer, and an
+    /// invocation that prints nothing by leaving the file unwritten would be a different tool.
+    #[test]
+    fn quiet_runs_still_write_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("quiet.folded");
+        let mut cli = cli(output.clone(), fixture(), "caller_of_heavy");
+        cli.quiet = true;
+
+        profile(&cli).unwrap();
+        let stacks = OutputFormatter::parse_folded(&std::fs::read_to_string(&output).unwrap())
+            .expect("a quiet run writes the same artifact a loud one does");
+        assert!(!stacks.is_empty());
+    }
+
+    /// `compare`'s table is the mode's whole answer rather than an echo of a file, so quiet may not
+    /// take it away — and this is the assertion that keeps the flag from being implemented as a
+    /// blanket "print nothing" at the top of `run`.
+    #[test]
+    fn quiet_does_not_silence_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = folded_file(&dir, "base.folded", "caller_of_heavy 100\n");
+        let current = folded_file(&dir, "new.folded", "caller_of_heavy 90\n");
+        let cli = Cli {
+            quiet: true,
+            ..compare_cli(baseline, current)
+        };
+        assert!(run(&cli).is_ok());
+    }
+
+    /// The ordering that makes `--quiet` safe on the failure path: `profile` returns early *after*
+    /// the artifact is written and *after* a trap is raised, so silence costs a caller its summary
+    /// and nothing else. A quiet run of a trapping contract is still exit `1` with #173's message.
+    #[test]
+    fn quiet_does_not_swallow_a_trap() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("boom.folded");
+        let temp_wasm = dir.path().join("boom.wasm");
+        std::fs::write(&temp_wasm, BOOM).unwrap();
+        let cli = Cli {
+            quiet: true,
+            ..cli(output.clone(), temp_wasm, "boom")
+        };
+
+        let error = input_failure(profile(&cli).unwrap_err());
+        assert!(
+            error.contains("trapped") && error.contains("boom.folded"),
+            "{error}"
+        );
+        assert!(output.exists(), "and the partial trace is still written");
+    }
+
+    /// The two flags are part of the interface a user reads before typing anything, and clap's help
+    /// is generated from the attributes — so the shorts, not just the longs, have to appear.
+    #[test]
+    fn the_short_help_lists_both_output_flags_with_their_shorts() {
+        let help = short_help();
+        for entry in ["-v, --verbose", "-q, --quiet"] {
+            assert!(
+                help.contains(entry),
+                "the help must advertise {entry:?}:\n{help}"
+            );
+        }
     }
 }

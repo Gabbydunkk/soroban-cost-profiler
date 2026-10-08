@@ -1,6 +1,10 @@
 use crate::models::{EventType, TraceEvent};
 use soroban_env_host::{Host, budget::AsBudget};
-use tracing::{debug, error, info, trace};
+// `error` is deliberately absent. With the subscriber #214 installs, an `error!` on a fatal path
+// prints a second copy of the sentence `main` already prints, with a module path in front of it;
+// the three sites that logged here are `debug!` now, so the breadcrumb survives for `-vv` while
+// the user-facing text stays single-sourced in the CLI.
+use tracing::{debug, info, trace};
 
 /// Collects costed execution events while a WASM contract runs under `wasmi`.
 ///
@@ -91,7 +95,7 @@ impl ExecutionTracer {
         );
         self.instruction_count = self.instruction_count.saturating_add(1);
         if self.instruction_count > self.instruction_ceiling {
-            error!("Instruction ceiling exceeded at PC: {}", pc);
+            debug!("Instruction ceiling exceeded at PC: {}", pc);
             return Err("Instruction ceiling exceeded");
         }
 
@@ -217,7 +221,7 @@ pub fn load_wasm_file(path: &str) -> std::io::Result<Vec<u8>> {
     info!("Loading WASM file from {}", path);
     let bytes = std::fs::read(path)?;
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
-        error!("Invalid WASM signature for file: {}", path);
+        debug!("Invalid WASM signature for file: {}", path);
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Invalid WASM signature",
@@ -358,7 +362,7 @@ pub fn invoke_function(
     });
 
     let func = instance.get_func(&mut *store, func_name).ok_or_else(|| {
-        error!("Function '{}' not found", func_name);
+        debug!("Function '{}' not found", func_name);
         wasmi::Error::new(format!("Function '{}' not found", func_name))
     })?;
 
