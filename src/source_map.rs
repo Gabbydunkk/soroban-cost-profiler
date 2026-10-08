@@ -212,9 +212,11 @@ pub struct SourceMapper {
     /// A degradation this mapper detected about itself and the user has to be told about (#186).
     ///
     /// Detection lives here because the ratio that produces it is this stage's own measurement;
-    /// *delivery* cannot, because nothing in this crate installs a `tracing` subscriber, so a
-    /// `tracing::warn!` written here reaches no terminal. The CLI reads this field and prints it to
-    /// stderr beside the fatal messages, which is the one channel this binary has.
+    /// *delivery* cannot, because a library stage has no terminal to write to and `main` owns the
+    /// CLI's output. A `tracing::warn!` written here would now reach a subscriber (#214), but only
+    /// at a level the user has to ask for — and a degradation the profiler knows about is news, not
+    /// narration. So the CLI reads this field and prints it to stderr beside the fatal messages,
+    /// which is the one channel that is always on.
     warning: Option<String>,
     /// Addresses whose inline stack this mapper has already computed (#158).
     ///

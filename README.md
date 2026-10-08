@@ -84,6 +84,8 @@ soroban-cost-profiler compare before.folded after.folded
 | `--metric <METRIC>` | `cpu` | `cpu`, `memory` or `hostcalls`. Sets what the counts in the file are denominated in; a `.folded` file does not record which, so both sides of a `compare` must have agreed on this flag beforehand. |
 | `--sample-rate <N>` | `1000` | Record one trace event every N traced steps; `0` is rejected, because it would silently turn sampling off and buffer every step. Today the engine reports one step per call boundary, so this flag changes *when* events are emitted rather than what they measure — see [Limitations](#the-counts-are-boundary-counts-not-instructions). |
 | `--instruction-limit <N>` | `100000000` | The bound on the trace buffer, now yours to set: the run stops past this many traced steps, the partial trace is still written, and the exit is `1` with `Instruction ceiling exceeded`. `0` is rejected — the counter increments before it compares, so a ceiling of 0 would stop the run at its first boundary. Same caveat as `--sample-rate`: steps are boundaries, so raising this lets a *boundary*-heavy contract finish and does nothing for a loop that never calls anything. |
+| `-v, --verbose` | off | Print the profiler's internal progress on **stderr**: `-v` the stages a run passes through, `-vv` every call boundary the engine reports, `-vvv` the costed step recorded at each one. Plain runs print none of it — see [What the two streams are for](#what-the-two-streams-are-for). |
+| `-q, --quiet` | off | Write the `.folded` artifact and print nothing on stdout. Not a silence button: `warning:` lines about a degraded run, every `error:`, and `compare`'s table still print, because those are news rather than narration. Refused next to `-v`. |
 | `compare <BASE> <CURRENT>` | — | The second mode: reads two `.folded` files, prints the functions whose cost moved, biggest move first. |
 
 `--help` prints these with their long-form notes and the exit-code table; `-h` is the short version;
@@ -119,6 +121,48 @@ never `file:line`. Build the copy you profile with a profiling profile — `[pro
 is the profile whose output gets deployed, and mainnet bills for the extra bytes.
 no function recorded any exclusive cost (cpu)
 ```
+
+### What the two streams are for
+
+Three kinds of text leave this tool, and they do not share a stream:
+
+| | stdout | stderr |
+|---|---|---|
+| the ranked summary, `compare`'s table | always (unless `--quiet`) | — |
+| `warning:` about a degraded run, `error:` about a refused input | never | always |
+| `tracing` records about the profiler's own progress | never | only with `-v` |
+
+The last row is #214, and it is the one worth a measured transcript, because the default is
+*nothing*: every stage of this pipeline has logged through `tracing` since the tracer was written, and
+until a subscriber was installed those records were discarded. `-v` is the subscriber, on stderr, with
+no ANSI escapes so it stays greppable:
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy -v 2>&1 >/dev/null
+2026-10-08T06:05:58.562669Z  INFO soroban_cost_profiler::tracer: Loading WASM file from fixtures/dwarf_probe/dwarf_probe.wasm
+2026-10-08T06:05:58.562988Z  INFO instantiate_module: soroban_cost_profiler::tracer: Instantiating WASM module
+2026-10-08T06:05:58.569862Z  INFO invoke_function{func_name="caller_of_heavy"}: soroban_cost_profiler::tracer: Invoking function: caller_of_heavy
+```
+
+The timestamp is UTC ISO-8601 and the `invoke_function{…}` prefix is the span the record was emitted
+inside, both from `tracing_subscriber`'s default format. `-vv` adds each call boundary the engine
+reports (`DEBUG … WASM Call at PC: 0`), and `-vvv` adds the single costed step recorded at each one
+(`TRACE … Stepping at PC: 0, cpu: 1, mem: 0`) — which is also the clearest statement of
+[the ceiling this tool works under](#the-counts-are-boundary-counts-not-instructions): two boundaries
+for a function that calls two helpers, because the engine hands the tracer nothing between them.
+
+`--quiet` suppresses the first row and nothing else. The name is the conventional Unix one — the
+artifact is the answer, so stdout goes empty — while warnings, errors, and `compare`'s table stay,
+because a run that worked less than you asked for is news:
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy --quiet
+$ cat profile.folded
+wasm[0] 0
+```
+
+`-v` and `--quiet` contradict each other, so clap refuses the pair rather than picking a winner
+silently (exit `1`, like any other command line to fix).
 
 ### Comparing two runs
 
@@ -244,14 +288,14 @@ wasm[0] 2
 That `2` is not a measurement of work. It is the number of boundaries the engine reported for one
 host-initiated call — `CallingWasm` and `ReturningFromWasm` — each charged one synthetic unit, because
 `invoke_function`'s hook has no instruction hook to hang a real count on and substitutes one step per
-boundary (`src/tracer.rs:352-356`). At the default `--sample-rate 1000` the accumulator gains 1 per boundary
+boundary (`src/tracer.rs:356-360`). At the default `--sample-rate 1000` the accumulator gains 1 per boundary
 and so never reaches the threshold, which is why the first run writes `0` rather than a small number.
 
 Consequences worth stating plainly:
 
 * `--metric cpu`, `--metric memory` and `--metric hostcalls` all produced `wasm[0] 0` for that run, measured
   on the same binary. Memory bytes and host-call counts reach the tree only through host frames — the budget
-  deltas read around a host call (`record_host_return`, `src/tracer.rs:172-187`) and the `HostCall` events
+  deltas read around a host call (`record_host_return`, `src/tracer.rs:176-191`) and the `HostCall` events
   that open them — and no host frame can open while nothing links a host function. So until
   [#210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210) lands, those two metrics are
   structurally empty rather than merely small.
@@ -263,7 +307,7 @@ Consequences worth stating plainly:
 ### Every frame lands at `wasm[0]`
 
 The call hook is handed the hook *variant* and nothing else — no callee, no offset — so all events are
-recorded at `pc = 0` (`src/tracer.rs:306-313`). And an internal instruction pointer would not fix it either:
+recorded at `pc = 0` (`src/tracer.rs:310-317`). And an internal instruction pointer would not fix it either:
 `wasmi` re-encodes wasm bytecode into its own instruction stream during translation and keeps no table back
 to the original offsets, so the finest address any future hook could hand this profiler is a function body's
 start.
@@ -279,13 +323,13 @@ already built and correct; today the trace never asks for anything but `0`.
 A contract whose entry point calls five helpers yields one `Call`/`Return` pair, not six, so the call tree
 the aggregator rebuilds is one level deep no matter how deep the contract goes. The probe
 `only_the_outer_invocation_is_recorded_as_a_boundary` in `tests/meter_probe.rs` pins it, and the doc block on
-`invoke_function` (`src/tracer.rs:289-322`) records both the limitation and what to change rather than delete
+`invoke_function` (`src/tracer.rs:293-326`) records both the limitation and what to change rather than delete
 when a per-call hook exists. `docs/internals/call_boundaries.md` describes the two boundary *types* the trace
 does distinguish — wasm calls and host transitions.
 
 ### Contracts that import the Soroban host do not run
 
-Linked to the empty `Linker` (`src/tracer.rs:171`), this is the blocker the IMPORTANT note above points at,
+Linked to the empty `Linker` (`src/tracer.rs:289`), this is the blocker the IMPORTANT note above points at,
 and it has two neighbours of the same kind, both measured on the built binary:
 
 * **No arguments are passed.** The export is invoked with an empty parameter list, so a contract export that
@@ -339,13 +383,13 @@ ones from whatever machine ran `rustc`, which is why file matching in the tests 
 ### The 100M ceiling cannot see an infinite loop
 
 The MVP's memory rule (`AGENTS.md` rule 5: a contract can run 100M instructions, so nothing may allocate
-per instruction) is why a 100M ceiling exists, and `record_step` enforces it (`src/tracer.rs:93`). Its limit
+per instruction) is why a 100M ceiling exists, and `record_step` enforces it (`src/tracer.rs:97`). Its limit
 is now a flag — `--instruction-limit`, [#213](https://github.com/Tollcraft/soroban-cost-profiler/issues/213)
 — but the flag does not change what the counter counts: its only caller in the live path is the call hook,
 which runs once per boundary —
 so the counter advances per boundary, not per instruction. A contract that loops forever *inside* one
 function body emits no boundaries, never advances the counter, and is not stopped; `wasmi`'s own fuel is set
-to `u64::MAX` for the run (`src/main.rs:385-387`), so the engine does not stop it either.
+to `u64::MAX` for the run (`src/main.rs:404-406`), so the engine does not stop it either.
 
 This is the sharpest edge in the tool, and it is the one place where the roadmap's
 "Infinite Loop Protection" box reads more strongly than the current engine can deliver — `ROADMAP.md` now

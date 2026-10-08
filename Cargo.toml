@@ -20,6 +20,14 @@ license = "Apache-2.0"
 [dependencies]
 soroban-env-host = "28.0.2"
 tracing = "0.1.44"
+# #214: every stage has logged through `tracing` since the tracer was written, and nothing ever
+# installed a subscriber, so those records were discarded — a profiler whose `info!` lines reach no
+# terminal is a library with a logging system and no reader. `default-features = false` is the
+# deliberate small half: `fmt` alone, without `ansi` (no escape codes, ever, which is what keeps
+# `docs/troubleshooting.md`'s "stderr is exactly the messages we chose" true when `-v` is on),
+# without `tracing-log` (this CLI bridges nothing), and without `env-filter` (verbosity is a clap
+# flag, not `RUST_LOG`, so `matchers`/`regex-automata` stay out of the tree).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 wasmi = "2.0.0"
 # Phase 3, #142. Both were already resolved in Cargo.lock at these versions by `backtrace`, so
 # this changes no existing version; the lock gains two small pure-Rust crates that gimli's

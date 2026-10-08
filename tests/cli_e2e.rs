@@ -373,6 +373,194 @@ fn an_instruction_limit_halts_the_run_and_keeps_the_trace_so_far() {
     );
 }
 
+/// #214 from outside the process, which is the only place its two halves are observable: that a
+/// subscriber writes, and which stream it writes to.
+///
+/// The split is the whole point of the test. Records go to stderr because stdout is the contract
+/// #184 pinned — the ranked summary is what callers pipe — so a subscriber on stdout would break
+/// exactly the runs that use `-v` and nothing else. Meanwhile the default level must stay silent:
+/// every message a user is meant to read leaves through `warn_user` or `main`, and a subscriber
+/// printing the same sentence twice over is the defect #198 removed.
+#[test]
+fn verbose_prints_the_stages_on_stderr_and_leaves_stdout_exactly_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir
+        .path()
+        .join("profile.folded")
+        .to_string_lossy()
+        .into_owned();
+    let base = [
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--output",
+        &output,
+    ];
+
+    let plain = profiler(&base);
+    code(&plain, 0);
+    assert!(
+        stderr(&plain).is_empty(),
+        "the default is WARN, and the crate has no `warn!` record left, so a plain run \
+         must print no tracing at all: {:?}",
+        stderr(&plain)
+    );
+
+    let verbose = profiler(&[base.as_slice(), &["-v"]].concat());
+    code(&verbose, 0);
+    let transcript = stderr(&verbose);
+    assert!(
+        transcript.contains("INFO") && transcript.contains("Invoking function: caller_of_heavy"),
+        "`-v` must name the stages a run passes through: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("\x1b["),
+        "the subscriber is built without `ansi`, so the transcript stays greppable and \
+         redirect-friendly: {transcript:?}"
+    );
+    assert_eq!(
+        stdout(&verbose),
+        stdout(&plain),
+        "records must not leak into the stream callers pipe"
+    );
+
+    // Deeper notches reach the engine's own breadcrumbs: every boundary the call hook reports,
+    // then the single costed step recorded at each one.
+    let boundaries = profiler(&[base.as_slice(), &["-vv"]].concat());
+    code(&boundaries, 0);
+    assert!(
+        stderr(&boundaries).contains("WASM Call at PC: 0"),
+        "`-vv` must show the boundaries: {:?}",
+        stderr(&boundaries)
+    );
+
+    let steps = profiler(&[base.as_slice(), &["-vvv"]].concat());
+    code(&steps, 0);
+    assert!(
+        stderr(&steps).contains("Stepping at PC: 0, cpu: 1, mem: 0"),
+        "`-vvv` must show the per-boundary step the tracer substitutes for an instruction hook: \
+         {:?}",
+        stderr(&steps)
+    );
+}
+
+/// `--quiet` is the conventional Unix meaning, and the e2e half is what makes it real: stdout empty
+/// while the artifact is byte-for-byte the one a loud run writes. Warnings and errors are not
+/// narration, so `a_degraded_run_under_quiet` below pins that they still arrive.
+#[test]
+fn quiet_writes_the_artifact_and_prints_nothing_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let loud = dir.path().join("loud.folded");
+    let silent = dir.path().join("silent.folded");
+    let loud_path = loud.to_string_lossy().into_owned();
+    let silent_path = silent.to_string_lossy().into_owned();
+
+    let plain = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--output",
+        &loud_path,
+    ]);
+    code(&plain, 0);
+    assert!(
+        !stdout(&plain).is_empty(),
+        "the default run prints its summary: {:?}",
+        stdout(&plain)
+    );
+
+    let quiet = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--output",
+        &silent_path,
+        "--quiet",
+    ]);
+    code(&quiet, 0);
+    assert_eq!(
+        stdout(&quiet),
+        "",
+        "`--quiet` means the file is the answer, so stdout carries nothing at all"
+    );
+    assert!(
+        stderr(&quiet).is_empty(),
+        "a healthy quiet run has no news either: {:?}",
+        stderr(&quiet)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&silent).unwrap(),
+        std::fs::read_to_string(&loud).unwrap(),
+        "quiet suppresses narration, not the profile"
+    );
+}
+
+/// The half a pure log-level flag would have got wrong. `--quiet` still reports: #186's degraded
+/// warning precedes the summary and survives the flag, because a run that worked less than the user
+/// asked for is news rather than commentary.
+#[test]
+fn quiet_keeps_the_warning_about_a_degraded_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir
+        .path()
+        .join("profile.folded")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&[
+        "--wasm",
+        NO_DEBUG_FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--output",
+        &output,
+        "--quiet",
+    ]);
+    code(&run, 0);
+    assert!(
+        stderr(&run).starts_with("warning:"),
+        "a degraded run must say so even when asked to be quiet: {:?}",
+        stderr(&run)
+    );
+    assert_eq!(stdout(&run), "", "and still print no summary");
+}
+
+/// Two flags that contradict each other are refused before the engine starts, with #183's code and
+/// both names in the message.
+#[test]
+fn verbose_and_quiet_are_refused_as_a_command_line_to_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir
+        .path()
+        .join("profile.folded")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--output",
+        &output,
+        "-v",
+        "--quiet",
+    ]);
+    code(&run, 1);
+    let message = stderr(&run);
+    assert!(
+        message.contains("--verbose") && message.contains("--quiet"),
+        "the refusal has to name both flags the user typed: {message:?}"
+    );
+    assert!(
+        !Path::new(&output).exists(),
+        "a refused command line never reaches the engine"
+    );
+}
+
 #[test]
 fn compare_reads_two_files_and_a_regression_is_still_a_successful_run() {
     let dir = tempfile::tempdir().unwrap();
