@@ -650,6 +650,261 @@ fn the_profiles_this_tool_writes_are_what_its_compare_reads() {
     );
 }
 
+/// #215's JSON format, through the real binary: the artifact has to be a document a program reads,
+/// not prose that happens to contain braces.
+///
+/// The metric assertion is the part no other format can carry. A `.folded` file records no metric, so
+/// `compare` cannot check that its two inputs agreed on `--metric` — here the disagreement is visible
+/// in the file itself, which is the actual reason this format exists beside the folded one.
+#[test]
+fn the_json_format_writes_a_document_that_names_its_own_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir
+        .path()
+        .join("profile.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "json",
+        "--output",
+        &output,
+    ]);
+    code(&run, 0);
+
+    let artifact = std::fs::read_to_string(&output).unwrap_or_else(|error| {
+        panic!("the run exited 0 but left no artifact at {output}: {error}")
+    });
+    let document: serde_json::Value = serde_json::from_str(&artifact).unwrap_or_else(|error| {
+        panic!("`--format json` wrote something that is not JSON: {error}\n{artifact}")
+    });
+
+    assert_eq!(document["metric"], "cpu");
+    assert_eq!(document["root"]["function"], "wasm[0]");
+    // What the tree says today, pinned in the new format the same way the folded artifact pins it:
+    // no program counter means no attribution, and the JSON cannot invent a cost the engine did not
+    // report. This assertion has to change when PC resolution lands, and that is the point.
+    assert_eq!(document["root"]["exclusive"]["cpu"], 0);
+    assert_eq!(document["root"]["inclusive"]["cpu"], 0);
+    assert!(
+        document["root"]["children"].is_array(),
+        "children are an array so a reader walks them without guessing at keys"
+    );
+
+    // The same contract under `--metric memory`: the numbers are still zero, the field is not.
+    let memory = dir
+        .path()
+        .join("memory.json")
+        .to_string_lossy()
+        .into_owned();
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "json",
+        "--metric",
+        "memory",
+        "--output",
+        &memory,
+    ]);
+    code(&run, 0);
+    let document = std::fs::read_to_string(&memory).unwrap();
+    assert!(
+        document.contains("\"metric\": \"memory\""),
+        "the metric a run selected has to be readable from its artifact:\n{document}"
+    );
+}
+
+/// `--output -` is a stream, not a file named `-`.
+///
+/// Both halves matter: the artifact has to arrive on stdout with nothing else in the way (a summary
+/// printed after it is a second document in a stream that parses as neither), and a file called `-`
+/// must not materialize in whoever's directory the run happened in.
+#[test]
+fn a_dash_output_sends_the_artifact_to_stdout_and_the_summary_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "json",
+        "--output",
+        "-",
+    ]);
+    code(&run, 0);
+
+    let text = stdout(&run);
+    let document: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+        panic!("stdout has to be one JSON document and nothing else: {error}\n{text}")
+    });
+    assert_eq!(document["metric"], "cpu");
+    assert!(
+        !text.contains("no function recorded"),
+        "the terminal summary cannot share stdout with the artifact: {text}"
+    );
+    assert!(
+        !dir.path().join("-").exists(),
+        "`-` is a convention for stdout, not a file this run may write"
+    );
+    // stderr is still stderr: warnings about a degraded run are not narration.
+    assert_eq!(stderr(&run), "", "a healthy run writes nothing on stderr");
+}
+
+/// `--format raw` with the byte-for-byte stream it writes, and the count the terminal adds.
+///
+/// Two rates, one contract: the engine reports two call boundaries and steps are what `--sample-rate`
+/// throttles, so the default run writes the two unconditional events and `--sample-rate 1` writes
+/// four. That is the ceiling `AGENTS.md` rule 5 and README's Limitations section describe, visible in
+/// an artifact without a tree in it — which is what this format is for.
+#[test]
+fn the_raw_format_writes_the_stream_the_engine_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let sampled = dir
+        .path()
+        .join("profile.raw")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "raw",
+        "--output",
+        &sampled,
+    ]);
+    code(&run, 0);
+    assert_eq!(
+        std::fs::read_to_string(&sampled).unwrap(),
+        "call pc=0 cpu=0 mem=0\nreturn pc=0 cpu=0 mem=0\n",
+        "at the default sample rate the only events are the two boundaries the engine emits itself"
+    );
+    assert_eq!(
+        stdout(&run),
+        format!("2 trace events written to {sampled}\n"),
+        "the terminal says what the file holds, because a raw run has no tree to rank"
+    );
+
+    let dense = dir.path().join("dense.raw").to_string_lossy().into_owned();
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "raw",
+        "--sample-rate",
+        "1",
+        "--output",
+        &dense,
+    ]);
+    code(&run, 0);
+    assert_eq!(
+        std::fs::read_to_string(&dense).unwrap(),
+        "call pc=0 cpu=0 mem=0\nstep pc=0 cpu=1 mem=0\nreturn pc=0 cpu=0 mem=0\nstep pc=0 cpu=1 mem=0\n",
+        "`--sample-rate 1` un-throttles the step events beside the boundaries"
+    );
+    assert!(
+        !stdout(&run).contains("no function recorded any exclusive cost"),
+        "a raw run never builds a tree, so it has no ranking to print: {:?}",
+        stdout(&run)
+    );
+}
+
+/// The trap message names the artifact's destination whatever that destination is (#215's `-`).
+///
+/// The file form is the sentence `docs/troubleshooting.md` quotes and the `--instruction-limit` test
+/// pins; the stdout form is new, and both have to stay true because together they are how a reader
+/// finds out that a truncated profile is truncated.
+#[test]
+fn a_halved_run_reports_where_its_partial_trace_went_in_either_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let halted = dir
+        .path()
+        .join("halted.json")
+        .to_string_lossy()
+        .into_owned();
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "json",
+        "--instruction-limit",
+        "1",
+        "--output",
+        &halted,
+    ]);
+    code(&run, 1);
+    assert!(
+        stderr(&run).contains(&format!("is in {halted},")),
+        "the file form keeps the wording the troubleshooting guide quotes: {:?}",
+        stderr(&run)
+    );
+
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "raw",
+        "--instruction-limit",
+        "1",
+        "--output",
+        "-",
+    ]);
+    code(&run, 1);
+    assert!(
+        stderr(&run).contains("The partial trace up to the trap is on stdout"),
+        "a run that halted while writing to a stream has to say so about the stream: {:?}",
+        stderr(&run)
+    );
+    assert_eq!(
+        stdout(&run),
+        "call pc=0 cpu=0 mem=0\nreturn pc=0 cpu=0 mem=0\n",
+        "and the partial stream still reaches that stream"
+    );
+}
+
+#[test]
+fn an_unknown_format_is_refused_and_names_the_ones_that_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("never.raw").to_string_lossy().into_owned();
+    let run = profiler(&[
+        "--wasm",
+        FIXTURE,
+        "--fn",
+        "caller_of_heavy",
+        "--format",
+        "yaml",
+        "--output",
+        &output,
+    ]);
+    code(&run, 1);
+    let message = stderr(&run);
+    assert!(
+        message.contains("--format") && message.contains("folded") && message.contains("raw"),
+        "the refusal has to name the flag and the values it accepts: {message}"
+    );
+    assert!(
+        !Path::new(&output).exists(),
+        "a refused command line runs no contract and writes nothing"
+    );
+}
+
 /// #184's literal subject: the real Soroban build, through the real binary.
 ///
 /// It is not in git (622 KB, and CI builds it in a job whose files the test job cannot read), so the

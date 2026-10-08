@@ -8,8 +8,9 @@
 //!    (`source_map`).
 //! 3. **Aggregate** — fold the flat stream into a [`CallStackNode`] tree carrying
 //!    inclusive/exclusive costs (`aggregator`).
-//! 4. **Format** — serialize the tree as `.folded` collapsed stacks for external
-//!    viewers such as speedscope (`formatter`).
+//! 4. **Format** — serialize the result in the shape `--format` asked for (#215): `.folded`
+//!    collapsed stacks for external viewers such as speedscope, a JSON call tree for a program that
+//!    walks it, or the raw event stream straight out of stage 1.
 //!
 //! Stage 1 is now a real run: `profile` reads `--wasm`, instantiates it, and invokes the export
 //! named by `--fn`. Stage 2 is the one that still under-delivers — the mapper resolves DWARF and
@@ -25,7 +26,7 @@
 use clap::{Parser, Subcommand};
 use soroban_cost_profiler::aggregator::ProfileAggregator;
 use soroban_cost_profiler::formatter::OutputFormatter;
-use soroban_cost_profiler::models::{Metric, TraceEvent};
+use soroban_cost_profiler::models::{Format, Metric, TraceEvent};
 use soroban_cost_profiler::source_map::{SourceMapError, SourceMapper};
 use soroban_cost_profiler::tracer::{
     ExecutionTracer, ProfilerState, instantiate_module, invoke_function, load_wasm_file,
@@ -92,8 +93,8 @@ fn parse_positive_u64(s: &str) -> Result<u64, String> {
     author,
     version,
     about,
-    long_about = "soroban-cost-profiler traces one exported function of a compiled Soroban contract and says where its cost went.\n\nTwo modes:\n  profile   --wasm <contract.wasm> --fn <export> runs that export under the instrumented engine and writes collapsed stacks to --output (default: profile.folded). Frames are named from the binary's own DWARF line tables when it has them; a binary built without debug info still profiles, and the run then says so on stderr instead of pretending its `wasm[pc]` frames are source lines.\n  compare   compare <base.folded> <new.folded> reads two profiles already on disk and prints the functions whose cost moved, biggest move first. It runs no contract, so it needs no --wasm.\n\nThe .folded file is the artifact. Open it in speedscope.app, or hand it to flamegraph.pl for a picture; this tool writes text and no SVG. The terminal summary is a glance at the same run, not a second source of truth.\n\nExit codes:\n  0  the run was honoured as asked; a compare that reports a regression still exits 0, because bad news is still an answer\n  1  the invocation could not be honoured as asked: a contract that cannot be read, parsed or linked, an export the module does not have, a contract that trapped, a .folded file that is missing or malformed, or a refused flag\n  2  the input was accepted and the profiler could not finish its own work: a write the machine refused for a reason other than the path, or an engine that would not configure",
-    after_help = "Examples:\n  # profile the `call` export\n  soroban-cost-profiler --wasm target/wasm32-unknown-unknown/release/contract.wasm --fn call\n\n  # the same run in memory units, into a named file\n  soroban-cost-profiler --wasm contract.wasm --fn call --metric memory --output memory.folded\n\n  # a denser trace: one event every 100 rather than every 1000\n  soroban-cost-profiler --wasm contract.wasm --fn call --sample-rate 100\n\n  # a heavier contract than the default bound allows\n  soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 200000000\n\n  # did the change help?\n  soroban-cost-profiler compare before.folded after.folded",
+    long_about = "soroban-cost-profiler traces one exported function of a compiled Soroban contract and says where its cost went.\n\nTwo modes:\n  profile   --wasm <contract.wasm> --fn <export> runs that export under the instrumented engine and writes its profile to --output, in whatever shape --format picks: collapsed stacks (the default), a JSON call tree, or the raw event stream. The name defaults to the format — profile.folded, profile.json, profile.raw — and `-` sends the artifact to stdout instead of a file. Frames are named from the binary's own DWARF line tables when it has them; a binary built without debug info still profiles, and the run then says so on stderr instead of pretending its `wasm[pc]` frames are source lines.\n  compare   compare <base.folded> <new.folded> reads two profiles already on disk and prints the functions whose cost moved, biggest move first. It runs no contract, so it needs no --wasm.\n\nThe .folded file is the artifact. Open it in speedscope.app, or hand it to flamegraph.pl for a picture; this tool writes text and no SVG. `--format json` is the same tree for a program that walks it, and `--format raw` is the trace before any of it was named or folded. The terminal summary is a glance at the same run, not a second source of truth.\n\nExit codes:\n  0  the run was honoured as asked; a compare that reports a regression still exits 0, because bad news is still an answer\n  1  the invocation could not be honoured as asked: a contract that cannot be read, parsed or linked, an export the module does not have, a contract that trapped, a .folded file that is missing or malformed, or a refused flag\n  2  the input was accepted and the profiler could not finish its own work: a write the machine refused for a reason other than the path, or an engine that would not configure",
+    after_help = "Examples:\n  # profile the `call` export\n  soroban-cost-profiler --wasm target/wasm32-unknown-unknown/release/contract.wasm --fn call\n\n  # the same run in memory units, into a named file\n  soroban-cost-profiler --wasm contract.wasm --fn call --metric memory --output memory.folded\n\n  # the call tree as structured data, straight into jq\n  soroban-cost-profiler --wasm contract.wasm --fn call --format json --output -\n\n  # what the engine actually reported: one line per recorded event\n  soroban-cost-profiler --wasm contract.wasm --fn call --format raw --sample-rate 1\n\n  # a denser trace: one event every 100 rather than every 1000\n  soroban-cost-profiler --wasm contract.wasm --fn call --sample-rate 100\n\n  # a heavier contract than the default bound allows\n  soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 200000000\n\n  # did the change help?\n  soroban-cost-profiler compare before.folded after.folded",
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
@@ -107,12 +108,19 @@ pub struct Cli {
     #[arg(short, long, required = true)]
     pub wasm: Option<PathBuf>,
 
-    /// Output file path for the .folded stacks
+    /// Where to write the artifact: `-` means stdout
     ///
-    /// This is the artifact the run leaves behind: speedscope.app opens it directly, and
-    /// `flamegraph.pl` turns it into a picture. `compare` reads files of this same shape.
-    #[arg(short, long, default_value = "profile.folded")]
-    pub output: PathBuf,
+    /// This is the artifact the run leaves behind: for `--format folded`, speedscope.app opens it
+    /// directly and `flamegraph.pl` turns it into a picture, and `compare` reads files of that same
+    /// shape. Omit the flag and the name follows the format — `profile.folded`, `profile.json`,
+    /// `profile.raw` — because a JSON tree sitting in a file called `.folded` is a trap for the next
+    /// command, which will hand it to `compare` or to a viewer expecting collapsed stacks.
+    ///
+    /// `-` is a convention and not a file: the artifact goes to stdout on its own, which is what
+    /// makes `--format json --output - | jq` work, and the terminal summary then stays silent
+    /// because two documents in one stream parse as neither.
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
 
     /// Exported function to invoke, e.g. `--fn call`
     ///
@@ -143,12 +151,24 @@ pub struct Cli {
     #[arg(long, default_value_t = 100_000_000, value_parser = parse_positive_u64)]
     pub instruction_limit: u64,
 
-    /// Cost metric the `.folded` counts are written in
+    /// Cost metric the counts are written in
     ///
     /// A `.folded` file records no metric of its own, so two files handed to `compare` must come
-    /// from runs that agreed on this flag already.
+    /// from runs that agreed on this flag already. `--format json` carries the metric inside the
+    /// document, which is the one thing the folded format cannot do; `--format raw` ignores this
+    /// flag because a trace event holds its cpu and memory deltas unselected.
     #[arg(long, value_enum, default_value_t = Metric::Cpu)]
     pub metric: Metric,
+
+    /// How the artifact is serialized: collapsed stacks, a JSON tree, or the raw event stream
+    ///
+    /// `folded` is what every other document here describes and what speedscope.app and
+    /// `flamegraph.pl` read. `json` is the same call tree as structured data, with the metric and
+    /// all three cost columns on every frame. `raw` is the trace before stages 2 and 3 — one line
+    /// per recorded event, no names and no tree — which is the format to reach for when a profile
+    /// looks wrong, and the reason it runs no symbolization at all.
+    #[arg(long, value_enum, default_value_t = Format::Folded)]
+    pub format: Format,
 
     /// Print the profiler's internal progress on stderr: `-v` stages, `-vv` every call boundary,
     /// `-vvv` every costed step
@@ -159,7 +179,7 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, conflicts_with = "quiet")]
     pub verbose: u8,
 
-    /// Write the `.folded` artifact and print nothing on stdout
+    /// Write the artifact and print nothing on stdout
     ///
     /// What is kept, deliberately: the artifact, every `warning:` line about a degraded run, and
     /// every fatal `error:` — quiet means "do not narrate", not "do not report". `compare`'s table
@@ -275,6 +295,90 @@ fn load_source_mapper(wasm_bytes: &[u8]) -> SourceMapper {
 /// Stage 3: build an empty aggregator.
 fn initialize_aggregator() -> ProfileAggregator {
     ProfileAggregator::new()
+}
+
+/// Where a run's artifact goes: a file, or stdout when `--output -` asked for it (#215).
+///
+/// A type rather than a `PathBuf` that might contain `"-"`, because that string would have to be
+/// re-checked at three places — the write itself, the write failure's message, and the trap message
+/// that tells the user where the partial trace went — and a missed check silently writes a file named
+/// `-` into the user's directory while the pipeline behind the pipe waits for a stdout it never gets.
+#[derive(Debug, PartialEq, Eq)]
+enum Destination {
+    Stdout,
+    File(PathBuf),
+}
+
+impl Destination {
+    /// How to call this destination in a message the user reads.
+    fn describe(&self) -> String {
+        match self {
+            Destination::Stdout => String::from("stdout"),
+            Destination::File(path) => path.display().to_string(),
+        }
+    }
+
+    /// "in `halted.folded`" / "on stdout", for the sentence that reports a trapped run.
+    ///
+    /// The preposition is part of the wording because the file form is quoted verbatim in
+    /// `docs/troubleshooting.md` and in the `--instruction-limit` tests; a message that read "is in
+    /// stdout" would be the one place this type leaked its own spelling into prose.
+    fn located(&self) -> String {
+        match self {
+            Destination::Stdout => String::from("on stdout"),
+            Destination::File(path) => format!("in {}", path.display()),
+        }
+    }
+
+    /// Write the artifact, turning a refusal into the kind of failure it is (#183's split).
+    fn write(&self, artifact: &str, label: &str) -> Result<(), Failure> {
+        let result = match self {
+            Destination::Stdout => {
+                use std::io::Write;
+                let handle = std::io::stdout();
+                let mut stdout = handle.lock();
+                stdout
+                    .write_all(artifact.as_bytes())
+                    .and_then(|()| stdout.flush())
+            }
+            Destination::File(path) => std::fs::write(path, artifact),
+        };
+        result.map_err(|error| {
+            let message = format!("failed to write {label} to {}: {error}", self.describe());
+            // A path whose parent does not exist is a command line we could never have honoured, so
+            // it is input like any other. Every other write failure — permissions, a full disk, a
+            // directory in place of a file — says more about the machine than about the invocation,
+            // and guessing at those would make the code less trustworthy, not more.
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Failure::Input(message)
+            } else {
+                Failure::Internal(message)
+            }
+        })
+    }
+}
+
+/// The file a run writes when `--output` is not given, named after the format that fills it.
+///
+/// One name per format because the formats are not interchangeable downstream: `compare` reads
+/// collapsed stacks and would report a JSON document as malformed on line 1, and speedscope reads
+/// collapsed stacks too. `profile.folded` is the name every document in this repository already
+/// quotes, so the default only changes for a reader who asked for a different format.
+fn default_artifact_name(format: Format) -> &'static str {
+    match format {
+        Format::Folded => "profile.folded",
+        Format::Json => "profile.json",
+        Format::Raw => "profile.raw",
+    }
+}
+
+/// Resolve `--output` for this run: a path, `-` as stdout, or the name that matches `--format`.
+fn artifact_destination(cli: &Cli) -> Destination {
+    match &cli.output {
+        Some(path) if path == Path::new("-") => Destination::Stdout,
+        Some(path) => Destination::File(path.clone()),
+        None => Destination::File(PathBuf::from(default_artifact_name(cli.format))),
+    }
 }
 
 /// Describe a `--fn` the module cannot run by listing the exports it does have.
@@ -438,14 +542,20 @@ fn run_target(
     })
 }
 
-/// Run the whole pipeline for one CLI invocation: write the folded stack to `--output` and print
-/// the ranked summary to stdout.
+/// Run the whole pipeline for one CLI invocation: write the artifact to `--output` and print the
+/// ranked summary to stdout.
 ///
 /// Stage 1 is now a real run of the contract named by `--fn`, so the tree it aggregates is the
 /// boundaries that run crossed. The costs in it are still all zero — see [`run_target`]'s note on
 /// what the engine hook reports — which is why the folded output names `wasm[0]` and nothing else,
 /// and why the summary today usually says that nothing was costed rather than lying with an
 /// empty table.
+///
+/// `--format` chooses the serialization at stage 4, and `raw` chooses a shorter pipeline: it is the
+/// stream straight out of stage 1, so stages 2 and 3 do not run for it at all. That is not an
+/// optimization but a requirement — [`aggregate`](soroban_cost_profiler::aggregator::ProfileAggregator::aggregate)
+/// consumes the event vector, so a raw run that aggregated first could only print the stream by
+/// cloning it, which is the per-trace heap growth `AGENTS.md` rule 5 forbids.
 ///
 /// A contract that traps mid-call is #173's case: the partial trace is aggregated and written,
 /// because the frames it crossed before the panic are the profile the user came for, and the
@@ -469,38 +579,48 @@ fn profile(cli: &Cli) -> Result<(), Failure> {
     let wasm_bytes = load_wasm_file(&wasm.to_string_lossy())
         .map_err(|error| Failure::Input(format!("failed to read {}: {error}", wasm.display())))?;
     let run = run_target(&wasm_bytes, &cli.fn_name, initialize_tracer(cli))?;
+    let destination = artifact_destination(cli);
 
-    // 2. Load DWARF source map
-    let mapper = load_source_mapper(&wasm_bytes);
+    // The artifact, and the one line the terminal adds about it. Two branches because `raw` has no
+    // tree to rank: its summary counts what the engine handed over, which is the same news the folded
+    // summary carries — did this run produce anything? — told in the units this format has. The word
+    // is "events" and not "boundaries" because the two differ: `record_call`/`record_return` emit
+    // unconditionally while steps are sampled, so `--sample-rate 1` on this repository's fixture
+    // writes four events across two boundaries.
+    let (artifact, summary) = if cli.format == Format::Raw {
+        (
+            OutputFormatter::to_raw_events(&run.events),
+            format!(
+                "{} trace events written to {}",
+                run.events.len(),
+                destination.describe()
+            ),
+        )
+    } else {
+        // 2. Load DWARF source map. 3. Aggregate events into call tree.
+        let mapper = load_source_mapper(&wasm_bytes);
+        let mut aggregator = initialize_aggregator();
+        let call_tree = aggregator.aggregate(run.events, &mapper);
 
-    // 3. Aggregate events into call tree
-    let mut aggregator = initialize_aggregator();
-    let call_tree = aggregator.aggregate(run.events, &mapper);
-
-    // 4. Format and output
-    let output = OutputFormatter::to_collapsed_stack(&call_tree, &cli.metric);
-    std::fs::write(&cli.output, output).map_err(|error| {
-        let message = format!(
-            "failed to write folded stack to {}: {error}",
-            cli.output.display()
-        );
-        // A path whose parent does not exist is a command line we could never have honoured, so
-        // it is input like any other. Every other write failure — permissions, a full disk, a
-        // directory in place of a file — says more about the machine than about the invocation,
-        // and guessing at those would make the code less trustworthy, not more.
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Failure::Input(message)
+        // 4. Format and output.
+        let artifact = if cli.format == Format::Json {
+            OutputFormatter::to_json_tree(&call_tree, &cli.metric)
         } else {
-            Failure::Internal(message)
-        }
-    })?;
+            OutputFormatter::to_collapsed_stack(&call_tree, &cli.metric)
+        };
+        let ranked = OutputFormatter::top_functions(&call_tree, &cli.metric, TOP_FUNCTIONS);
+        let summary =
+            OutputFormatter::to_top_summary(&ranked, &cli.metric, std::io::stdout().is_terminal());
+        (artifact, summary)
+    };
+    destination.write(&artifact, cli.format.artifact_label())?;
 
     if let Some(trap) = run.trapped {
         return Err(Failure::Input(format!(
-            "'{fn}' trapped: {trap}. The partial trace up to the trap is in {path}, and its costs \
+            "'{fn}' trapped: {trap}. The partial trace up to the trap is {located}, and its costs \
              are incomplete because the call never returned.",
             fn = cli.fn_name,
-            path = cli.output.display()
+            located = destination.located()
         )));
     }
 
@@ -508,15 +628,16 @@ fn profile(cli: &Cli) -> Result<(), Failure> {
     // file already carries, so a caller who asked for silence gets the file and an empty stdout;
     // the warnings and errors above this line are their own sites' output and stay, because quiet
     // is about narration and not about news.
-    if cli.quiet {
+    //
+    // `--output -` is the other half of the same rule: stdout already holds the artifact, and a
+    // summary printed after it is a second document in a stream that parses as neither. So the
+    // stream gets the document and the terminal gets nothing — which is exactly why the flag is
+    // worth having, and why the exit code is still the run's answer.
+    if cli.quiet || destination == Destination::Stdout {
         return Ok(());
     }
 
-    let ranked = OutputFormatter::top_functions(&call_tree, &cli.metric, TOP_FUNCTIONS);
-    println!(
-        "{}",
-        OutputFormatter::to_top_summary(&ranked, &cli.metric, std::io::stdout().is_terminal())
-    );
+    println!("{summary}");
     Ok(())
 }
 
@@ -682,11 +803,12 @@ mod tests {
     fn cli(output: PathBuf, wasm: PathBuf, fn_name: &str) -> Cli {
         Cli {
             wasm: Some(wasm),
-            output,
+            output: Some(output),
             fn_name: fn_name.into(),
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
+            format: Format::Folded,
             verbose: 0,
             quiet: false,
             command: None,
@@ -697,11 +819,12 @@ mod tests {
     fn compare_cli(baseline: PathBuf, current: PathBuf) -> Cli {
         Cli {
             wasm: None,
-            output: PathBuf::from("unused.folded"),
+            output: Some(PathBuf::from("unused.folded")),
             fn_name: String::new(),
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
+            format: Format::Folded,
             verbose: 0,
             quiet: false,
             command: Some(Command::Compare { baseline, current }),
@@ -981,6 +1104,11 @@ mod tests {
     /// `[default: ]` on `--fn` reads as though an empty export name were accepted. It is not — the
     /// run refuses it — and an empty default is an artifact of how the flag is parsed, not a value
     /// worth advertising.
+    ///
+    /// `--output` is the one flag whose default this test cannot check as clap prints it, because it
+    /// has none to print: the name depends on `--format`, so it is computed at the run and stated in
+    /// the flag's own help text. The second half of this test is what keeps that honest — the three
+    /// names have to be readable from the help, not only from this source file.
     #[test]
     fn the_short_help_hides_defaults_that_mean_nothing() {
         let help = short_help();
@@ -988,14 +1116,64 @@ mod tests {
             !help.contains("[default: ]"),
             "an empty default must not be presented as if it were one"
         );
-        for real in [
-            "[default: profile.folded]",
-            "[default: 1000]",
-            "[default: cpu]",
-        ] {
+        for real in ["[default: 1000]", "[default: cpu]", "[default: folded]"] {
             assert!(
                 help.contains(real),
                 "a real default must still show: {real}"
+            );
+        }
+
+        let long = long_help();
+        for name in ["profile.folded", "profile.json", "profile.raw"] {
+            assert!(
+                long.contains(name),
+                "`--output` has no printed default, so the help itself has to name the file each \
+                 format writes: missing {name}"
+            );
+        }
+    }
+
+    /// Every format writes the file that matches its name, and none of them reuses another's.
+    #[test]
+    fn each_format_defaults_to_the_file_named_after_it() {
+        for (format, name) in [
+            (Format::Folded, "profile.folded"),
+            (Format::Json, "profile.json"),
+            (Format::Raw, "profile.raw"),
+        ] {
+            let mut cli = cli(PathBuf::new(), fixture(), "caller_of_heavy");
+            cli.output = None;
+            cli.format = format;
+            assert_eq!(
+                artifact_destination(&cli),
+                Destination::File(PathBuf::from(name)),
+                "a run with no `--output` has to write {name}"
+            );
+        }
+    }
+
+    /// `-` is stdout and not a file called `-` in the current directory.
+    ///
+    /// The whole of the difference is which stream the bytes reach: a pipeline waiting on stdout
+    /// hangs, and the user finds a file named `-` they did not ask for.
+    #[test]
+    fn a_dash_output_is_stdout_and_not_a_filename() {
+        for path in ["-", "./-"] {
+            let mut cli = cli(PathBuf::new(), fixture(), "caller_of_heavy");
+            cli.output = Some(PathBuf::from(path));
+            assert_eq!(
+                artifact_destination(&cli),
+                if path == "-" {
+                    Destination::Stdout
+                } else {
+                    Destination::File(PathBuf::from(path))
+                },
+                "`--output {path}` has to be read as {}",
+                if path == "-" {
+                    "stdout"
+                } else {
+                    "a relative file named `-`"
+                }
             );
         }
     }
@@ -1035,6 +1213,32 @@ mod tests {
             "a write the machine refused must exit 2: {}",
             failure.message()
         );
+    }
+
+    /// A refused write names the document it could not produce (#215).
+    ///
+    /// Three formats now share one write path, and one message that says "folded stack" while the
+    /// run was asked for JSON sends the reader to the wrong entry of `docs/troubleshooting.md`, which
+    /// quotes this sentence. The folded wording is checked byte-for-byte for the same reason.
+    #[test]
+    fn a_refused_write_names_the_format_it_was_attempting() {
+        let dir = tempfile::tempdir().unwrap();
+        let unwritable = dir.path().to_path_buf();
+        for (format, label) in [
+            (Format::Folded, "failed to write folded stack to"),
+            (Format::Json, "failed to write JSON call tree to"),
+            (Format::Raw, "failed to write raw event stream to"),
+        ] {
+            let mut cli = cli(unwritable.clone(), fixture(), "caller_of_heavy");
+            cli.format = format;
+            let failure = profile(&cli).unwrap_err();
+            assert_eq!(failure.code(), 2, "{label}: {}", failure.message());
+            assert!(
+                failure.message().contains(label),
+                "the message has to name {label:?}, got {}",
+                failure.message()
+            );
+        }
     }
 
     /// #182's "done": `--sample-rate 0` returns a descriptive error. Zero is worth the named

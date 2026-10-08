@@ -45,6 +45,12 @@ addr2line = { version = "0.25.1", default-features = false, features = ["rustc-d
 # not a hand-written DWARF parser, which is what `AGENTS.md` requires.
 gimli = { version = "0.32.3", default-features = false, features = ["read", "endian-reader", "std"] }
 clap = { version = "=4.5.0", features = ["derive"] }
+# #215: `--format json` writes the call tree as structured data. `serde_json` was already resolved in
+# `Cargo.lock` at this version by `soroban-env-host`'s own snapshot types, so declaring it here changes
+# no version and adds no new crate to the tree — only the one direct edge the formatter needs. It is
+# used through `Value`/`Map` rather than `#[derive(Serialize)]`, which keeps `serde`'s derive machinery
+# (`serde_derive`, and a procedural macro build) out of a crate that has no type to annotate.
+serde_json = "1.0.151"
 
 [profile.release]
 opt-level = "z"

@@ -35,6 +35,7 @@ from any command line:
 | `Instruction ceiling exceeded` | The trace-buffer guard tripped at your `--instruction-limit` | [The ceiling](#about-the-100m-instruction-limit) |
 | No records on stderr when you want them | The default level prints none; `-v` installs the transcript | [What the profiler is doing](#i-want-to-see-what-the-profiler-is-doing) |
 | `--quiet` prints nothing on stdout and exits `0` | The flag's whole job: the artifact is the answer | [`--quiet`](#--quiet-printed-nothing-is-that-a-failure) |
+| `--output -` prints the profile and the summary vanishes | The artifact took stdout, which the summary also wanted | [`--output -`](#--output-printed-the-profile-and-none-of-the-summary) |
 | `error: … (os error 2)` and friends | Bad path, bad file, bad flag | [Exit codes](#exit-codes-1-and-2) |
 
 ## The profile is one line of zeros
@@ -274,7 +275,7 @@ rebuild it.
 ## The output path is wrong, and which exit code it earns
 
 Exit codes are the documented `0` success, `1` "the invocation could not be honoured as asked", `2` "the
-input was accepted and the profiler could not finish its own work" (`src/main.rs:482-496` splits these two on
+input was accepted and the profiler could not finish its own work" (`src/main.rs:333-358` splits these two on
 the error kind, so a path you could never have written to is `1` and a machine refusing a write is `2`):
 
 ```console
@@ -298,6 +299,24 @@ $ echo $?
 all the way to stage 4 before any of these failed, so the contract *did* execute: fixing the path and
 re-running costs you a full trace, which for a real contract is the expensive part.
 
+The same three failures with `--format json` or `--format raw` name the format instead of `folded stack`, so
+the message tells you which artifact was abandoned:
+
+```console
+$ soroban-cost-profiler --wasm contract.wasm --fn call --format json --output missing/dir/profile.json
+error: failed to write JSON call tree to missing/dir/profile.json: No such file or directory (os error 2)
+
+$ soroban-cost-profiler --wasm contract.wasm --fn call --format raw --output .
+error: failed to write raw event stream to .: Is a directory (os error 21)
+$ echo $?
+2
+```
+
+Omitting `--output` altogether is not an error and writes no `profile.folded` unless you asked for the folded
+format: each format defaults to the file named after it (`profile.folded`, `profile.json`, `profile.raw`), so
+three runs of one contract with only `--format` changing leave three files beside each other rather than one
+file rewritten with bytes the next reader will misparse.
+
 ## Refused flags
 
 clap refuses these before anything runs, and the profiler overrides clap's own exit code so a typo'd flag
@@ -313,6 +332,10 @@ error: invalid value 'gas' for '--metric <METRIC>'
 
 $ soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 0
 error: invalid value '0' for '--instruction-limit <INSTRUCTION_LIMIT>': must be greater than 0
+
+$ soroban-cost-profiler --wasm contract.wasm --fn call --format yaml
+error: invalid value 'yaml' for '--format <FORMAT>'
+  [possible values: folded, json, raw]
 
 $ soroban-cost-profiler --wasm contract.wasm --fn call -v --quiet
 error: the argument '--verbose...' cannot be used with '--quiet'
@@ -379,6 +402,50 @@ kinds of output — a `warning:` about a binary it could not symbolize and an `e
 not happen still print, because those are news about your command rather than commentary on the profiler's
 day, and `compare`'s table stays too, since for that mode the table is the answer and not an echo.
 
+## `--output -` printed the profile and none of the summary
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy --output -
+wasm[0] 0
+```
+
+That is the whole stdout, and the missing part is the `no function recorded any exclusive cost (cpu)` line
+you would get on a run that wrote a file. **Why.** `--output -` means "the artifact goes to stdout" — the
+convention every `flamegraph.pl` and `jq` invocation already speaks — and stdout can only hold one thing. The
+summary is commentary *about* the artifact, so when the artifact is the stream the commentary is dropped
+rather than interleaved into it: a `| jq .metric` on the other side of the pipe would otherwise be parsing a
+line of prose. The same rule is why `-v`'s transcript is stderr.
+
+`--format` changes what arrives but not the rule:
+
+```console
+$ soroban-cost-profiler --wasm …/dwarf_probe.wasm --fn caller_of_heavy --format json --output - | jq .metric
+"cpu"
+$ soroban-cost-profiler --wasm …/dwarf_probe.wasm --fn caller_of_heavy --format raw --output -
+call pc=0 cpu=0 mem=0
+return pc=0 cpu=0 mem=0
+```
+
+So the two ways to "get nothing on stdout" are different. `--quiet` writes the file and stays out of stdout;
+`--output -` fills stdout and writes no file — `ls` after it shows no `profile.folded`, and a script that
+looked for one has to redirect instead. Only the exact single dash means stdout: `--output new-run.folded` is
+a file, and `--output -run.folded` never reaches the profiler at all, because clap reads the leading dash as a
+short flag and refuses the command line with `error: unexpected argument '-r' found`.
+
+The trap message tracks the destination, because its job is to say where the partial trace went:
+
+```console
+$ soroban-cost-profiler --wasm …/dwarf_probe.wasm --fn caller_of_heavy --format raw --instruction-limit 1 --output -
+call pc=0 cpu=0 mem=0
+return pc=0 cpu=0 mem=0
+error: 'caller_of_heavy' trapped: Instruction ceiling exceeded. The partial trace up to the trap is on stdout, and its costs are incomplete because the call never returned.
+$ echo $?
+1
+```
+
+The events before that `error:` are the frames the run crossed, exactly as the file version keeps them, and
+the exit code is still `1` — a halved stream on stdout is a truncated profile no more than a halved file is.
+
 ## `compare` complains
 
 ```console
@@ -436,7 +503,7 @@ does not say, and a reader should know before trusting it:
   which runs once per boundary (`src/tracer.rs:356-360`), and one host-initiated call gives two of them —
   which is why `1` halts a function that computes a million instructions and `2` lets it finish. A contract
   that loops forever *inside* one function body emits no boundaries, never advances the counter, and is not
-  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:404-406`), so the engine
+  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:505-510`), so the engine
   does not stop it either.
 
 So if your symptom is "it hangs" or "my machine ran out of memory", the ceiling message is not the diagnosis,

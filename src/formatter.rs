@@ -1,4 +1,4 @@
-use crate::models::{CallStackNode, Metric};
+use crate::models::{CallStackNode, EventType, Metric, TraceEvent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -58,6 +58,21 @@ fn metric_name(metric: &Metric) -> &'static str {
         Metric::Cpu => "cpu",
         Metric::Memory => "memory",
         Metric::Hostcalls => "hostcalls",
+    }
+}
+
+/// The boundary kind as `--format raw` spells it.
+///
+/// Lowercase snake_case, the way `metric_name` spells its metric: the raw stream is a document a
+/// script reads, so its vocabulary has to match the flag vocabulary rather than `EventType`'s
+/// `Debug`, which would print `HostCall` and change if a variant is renamed.
+fn event_kind(kind: &EventType) -> &'static str {
+    match kind {
+        EventType::Call => "call",
+        EventType::Return => "return",
+        EventType::Step => "step",
+        EventType::HostCall => "host_call",
+        EventType::HostReturn => "host_return",
     }
 }
 
@@ -198,6 +213,95 @@ impl OutputFormatter {
 
         // Backtrack efficiently by truncating to the original length
         current_path.truncate(original_len);
+    }
+
+    /// [`to_collapsed_stack`]'s tree as structured data, for a program that has to walk it (#215).
+    ///
+    /// Two things the folded format structurally cannot carry, and one of them is the reason this
+    /// format exists at all: a `.folded` file records no metric, so two of them handed to `compare`
+    /// can disagree on `--metric` and nothing detects it. Here the metric is a field, and every node
+    /// carries all three cost columns as `exclusive`/`inclusive` objects rather than the one number
+    /// folded selects — so a JSON artifact names what its numbers are denominated in, and a reader
+    /// who switches metrics sees the switch in the document instead of in a command line history.
+    ///
+    /// [`to_collapsed_stack`]: OutputFormatter::to_collapsed_stack
+    pub fn to_json_tree(root: &CallStackNode, metric: &Metric) -> String {
+        let tree = serde_json::json!({
+            "metric": metric_name(metric),
+            "root": Self::json_node(root),
+        });
+        let mut output =
+            serde_json::to_string_pretty(&tree).expect("a call tree is always serializable");
+        output.push('\n');
+        output
+    }
+
+    /// One node, recursively. `children` is an array sorted by its map key.
+    ///
+    /// Sorted because `CallStackNode::children` is a `HashMap` and its iteration order is not stable
+    /// across runs: two profiles of the same contract would then produce byte-different JSON, which
+    /// defeats the point of a format meant for a program to read — including a CI job that diffs the
+    /// artifact. The folded writer does not need this because its stacks are distinguished by their
+    /// whole paths, not by sibling order.
+    fn json_node(node: &CallStackNode) -> serde_json::Value {
+        let mut children: Vec<&CallStackNode> = node.children.values().collect();
+        children.sort_by(|a, b| a.frame.function_name.cmp(&b.frame.function_name));
+
+        serde_json::json!({
+            "function": node.frame.function_name,
+            "file": node.frame.file_path,
+            "line": node.frame.line_number,
+            "exclusive": {
+                "cpu": node.exclusive_cpu,
+                "memory": node.exclusive_mem,
+                "hostcalls": node.exclusive_hostcalls,
+            },
+            "inclusive": {
+                "cpu": node.inclusive_cpu,
+                "memory": node.inclusive_mem,
+                "hostcalls": node.inclusive_hostcalls,
+            },
+            "children": children
+                .iter()
+                .copied()
+                .map(Self::json_node)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The trace as the engine emitted it: one line per recorded event, before any naming or
+    /// tree-building touched it (#215).
+    ///
+    /// The other two formats answer "where did my contract's cost go"; this answers "what did the
+    /// engine actually report", which is why it is the format to reach for when a profile looks wrong
+    /// — it shows the zero-cost, `pc = 0` events that aggregation folds into one `wasm[0]` frame, and
+    /// it is the only one of the three whose output changes when #210's instruction hook adds real
+    /// instruction events. It takes no metric for the same reason it takes no summary: nothing has
+    /// been selected out of the stream yet, so a line carries its own `cpu` and `mem` deltas beside
+    /// the kind that produced them.
+    ///
+    /// Events and not boundaries, because the two are not the same count: `record_call` and
+    /// `record_return` emit unconditionally while steps pass the `--sample-rate` throttle, so this
+    /// repository's fixture writes two lines at the default rate and four at `--sample-rate 1` for the
+    /// same two call boundaries.
+    ///
+    /// Text and not JSON on purpose: the stream can be as long as the traced run, and this loop must
+    /// not allocate per event (`AGENTS.md` rule 5). One `writeln!` into a pre-sized `String` allocates
+    /// nothing per line, where a serialized value per line would; a reader who wants the stream as
+    /// structured data has the tree.
+    pub fn to_raw_events(events: &[TraceEvent]) -> String {
+        let mut output = String::with_capacity(events.len() * 32 + 1);
+        for event in events {
+            let _ = writeln!(
+                output,
+                "{} pc={} cpu={} mem={}",
+                event_kind(&event.event_type),
+                event.pc,
+                event.cpu_cost,
+                event.mem_cost,
+            );
+        }
+        output
     }
 
     /// Read a folded-stack artifact (`<stack> <count>` per line) into stack -> cost.
@@ -967,5 +1071,169 @@ mod tests {
             OutputFormatter::to_compare_report(&deltas, false).contains("1 of 2 functions changed"),
             "the unchanged `main` frame is tallied, not printed"
         );
+    }
+
+    /// #215's JSON format: parse the document rather than match its text, because the claim is that a
+    /// program can read it.
+    fn json_tree(root: &CallStackNode, metric: &Metric) -> serde_json::Value {
+        let artifact = OutputFormatter::to_json_tree(root, metric);
+        serde_json::from_str(&artifact).unwrap_or_else(|error| {
+            panic!("`--format json` has to write a JSON document, got {error}: {artifact}")
+        })
+    }
+
+    #[test]
+    fn the_json_document_names_the_metric_the_folded_file_cannot() {
+        // The reason this format exists next to `folded`: a `.folded` file has no metric field, so
+        // `compare` cannot check that two files agreed on `--metric`. Here the disagreement is
+        // visible in the document instead.
+        let tree = node("main", 10, vec![leaf("sum_squares", 90)]);
+        for (metric, name) in [
+            (Metric::Cpu, "cpu"),
+            (Metric::Memory, "memory"),
+            (Metric::Hostcalls, "hostcalls"),
+        ] {
+            assert_eq!(
+                json_tree(&tree, &metric)["metric"],
+                name,
+                "the metric has to be readable from the artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_frame_carries_the_location_and_both_cost_columns() {
+        // Folded stacks flatten the tree into a path and keep one number. The JSON form keeps what
+        // the tree already knew and cannot put in a path: `file:line`, and exclusive beside inclusive.
+        let mut child = leaf("sum_squares", 90);
+        child.frame.file_path = Some("src/lib.rs".to_string());
+        child.frame.line_number = Some(12);
+        child.exclusive_mem = 7;
+        child.inclusive_mem = 7;
+        let tree = node("main", 10, vec![child]);
+
+        let document = json_tree(&tree, &Metric::Cpu);
+        assert_eq!(document["root"]["function"], "main");
+        assert_eq!(document["root"]["children"][0]["function"], "sum_squares");
+        assert_eq!(document["root"]["children"][0]["file"], "src/lib.rs");
+        assert_eq!(document["root"]["children"][0]["line"], 12);
+        assert_eq!(document["root"]["children"][0]["exclusive"]["cpu"], 90);
+        assert_eq!(document["root"]["children"][0]["exclusive"]["memory"], 7);
+        assert_eq!(document["root"]["inclusive"]["cpu"], 100);
+
+        let unresolved = json_tree(&leaf("wasm[0]", 0), &Metric::Cpu);
+        assert!(unresolved["root"]["file"].is_null());
+        assert!(unresolved["root"]["line"].is_null());
+        assert!(unresolved["root"]["children"].is_array());
+    }
+
+    #[test]
+    fn the_json_emits_children_in_sorted_order_not_the_map_s() {
+        // `children` is a `HashMap`, so iteration order is not stable across processes. The folded
+        // writer does not care — its lines are distinguished by whole paths — but a CI job that diffs
+        // JSON artifacts cares a great deal, and a sibling order that moved would read as a
+        // regression. So the arrays are sorted, which this pins from a tree whose children are built
+        // in an order no reader would write: if the writer passed the map through, `zulu` would come
+        // first, and it does not.
+        let tree = node(
+            "main",
+            1,
+            vec![leaf("zulu", 20), leaf("alpha", 10), leaf("mike", 30)],
+        );
+        let document = json_tree(&tree, &Metric::Cpu);
+        let names: Vec<&str> = document["root"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["function"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha", "mike", "zulu"],
+            "`children` has to be emitted in sorted order, not the map's order"
+        );
+    }
+
+    #[test]
+    fn the_raw_stream_is_the_events_and_nothing_else() {
+        // The format's whole promise: what the engine reported, before naming or aggregation. No
+        // frame names, no tree, no metric column — one line per event with its own deltas.
+        let events = vec![
+            TraceEvent {
+                pc: 0,
+                event_type: EventType::Call,
+                cpu_cost: 1,
+                mem_cost: 0,
+            },
+            TraceEvent {
+                pc: 42,
+                event_type: EventType::HostCall,
+                cpu_cost: 1000,
+                mem_cost: 64,
+            },
+        ];
+        assert_eq!(
+            OutputFormatter::to_raw_events(&events),
+            "call pc=0 cpu=1 mem=0\nhost_call pc=42 cpu=1000 mem=64\n"
+        );
+    }
+
+    #[test]
+    fn every_event_kind_is_spelled_once_and_distinctly() {
+        // `event_kind` maps five variants onto five words; a repeated word would merge two boundary
+        // kinds in a format whose only content is the boundary kind.
+        let kinds = [
+            (EventType::Call, "call"),
+            (EventType::Return, "return"),
+            (EventType::Step, "step"),
+            (EventType::HostCall, "host_call"),
+            (EventType::HostReturn, "host_return"),
+        ];
+        let mut words: Vec<&str> = Vec::new();
+        for (kind, word) in &kinds {
+            let line = OutputFormatter::to_raw_events(&[TraceEvent {
+                pc: 0,
+                event_type: kind.clone(),
+                cpu_cost: 0,
+                mem_cost: 0,
+            }]);
+            assert!(
+                line.starts_with(*word),
+                "{kind:?} has to be spelled `{word}`, got {line:?}"
+            );
+            words.push(*word);
+        }
+        let unique: BTreeSet<&str> = words.iter().copied().collect();
+        assert_eq!(unique.len(), kinds.len(), "two boundary kinds share a word");
+    }
+
+    #[test]
+    fn a_trace_that_recorded_nothing_is_an_empty_stream() {
+        // The raw format writes exactly what it was handed, so an empty trace is an empty file and
+        // not a header, a placeholder line, or a zero. Measured through the CLI, the file beside this
+        // claim has two lines (`call` and `return`) even at the default `--sample-rate 1000`, because
+        // boundaries are emitted unconditionally and only steps are throttled.
+        assert_eq!(OutputFormatter::to_raw_events(&[]), "");
+    }
+
+    #[test]
+    fn the_json_and_folded_formats_agree_on_one_tree_s_cost() {
+        // Two serializations of the same tree must not disagree about what it cost, or a reader who
+        // switches formats sees a different profile from the same run.
+        let tree = node("main", 10, vec![leaf("sum_squares", 90)]);
+        let document = json_tree(&tree, &Metric::Cpu);
+        let folded = OutputFormatter::parse_folded(&OutputFormatter::to_collapsed_stack(
+            &tree,
+            &Metric::Cpu,
+        ))
+        .unwrap();
+
+        let json_total = document["root"]["exclusive"]["cpu"].as_u64().unwrap()
+            + document["root"]["children"][0]["exclusive"]["cpu"]
+                .as_u64()
+                .unwrap();
+        let folded_total: u64 = folded.values().sum();
+        assert_eq!(json_total, folded_total);
+        assert_eq!(json_total, 100);
     }
 }

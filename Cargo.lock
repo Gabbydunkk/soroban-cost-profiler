@@ -1991,6 +1991,7 @@ dependencies = [
  "clap",
  "criterion",
  "gimli",
+ "serde_json",
  "soroban-env-host 28.0.2",
  "tempfile",
  "tracing",

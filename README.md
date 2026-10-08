@@ -80,12 +80,13 @@ soroban-cost-profiler compare before.folded after.folded
 |---|---|---|
 | `-w, --wasm <PATH>` | — | The compiled contract. Required for profiling; not accepted next to `compare`, which runs nothing. |
 | `--fn <EXPORT>` | — | The exported function to invoke. Profiling refuses to start without a name, and a name the module does not export is an error that lists the exports it does have. |
-| `-o, --output <PATH>` | `profile.folded` | Where the collapsed stacks are written. |
-| `--metric <METRIC>` | `cpu` | `cpu`, `memory` or `hostcalls`. Sets what the counts in the file are denominated in; a `.folded` file does not record which, so both sides of a `compare` must have agreed on this flag beforehand. |
+| `-o, --output <PATH>` | the format's own name | Where the artifact is written, or `-` for stdout. Omit it and the name follows `--format`: `profile.folded`, `profile.json`, `profile.raw`. |
+| `--metric <METRIC>` | `cpu` | `cpu`, `memory` or `hostcalls`. Sets what the counts in the file are denominated in; a `.folded` file does not record which, so both sides of a `compare` must have agreed on this flag beforehand. `--format json` writes the metric into the document; `--format raw` ignores it, because a trace event carries its cpu and memory deltas unselected. |
+| `--format <FORMAT>` | `folded` | `folded`, `json` or `raw` — how the run's result is serialized. See [Three output formats](#three-output-formats). |
 | `--sample-rate <N>` | `1000` | Record one trace event every N traced steps; `0` is rejected, because it would silently turn sampling off and buffer every step. Today the engine reports one step per call boundary, so this flag changes *when* events are emitted rather than what they measure — see [Limitations](#the-counts-are-boundary-counts-not-instructions). |
 | `--instruction-limit <N>` | `100000000` | The bound on the trace buffer, now yours to set: the run stops past this many traced steps, the partial trace is still written, and the exit is `1` with `Instruction ceiling exceeded`. `0` is rejected — the counter increments before it compares, so a ceiling of 0 would stop the run at its first boundary. Same caveat as `--sample-rate`: steps are boundaries, so raising this lets a *boundary*-heavy contract finish and does nothing for a loop that never calls anything. |
 | `-v, --verbose` | off | Print the profiler's internal progress on **stderr**: `-v` the stages a run passes through, `-vv` every call boundary the engine reports, `-vvv` the costed step recorded at each one. Plain runs print none of it — see [What the two streams are for](#what-the-two-streams-are-for). |
-| `-q, --quiet` | off | Write the `.folded` artifact and print nothing on stdout. Not a silence button: `warning:` lines about a degraded run, every `error:`, and `compare`'s table still print, because those are news rather than narration. Refused next to `-v`. |
+| `-q, --quiet` | off | Write the artifact and print nothing on stdout. Not a silence button: `warning:` lines about a degraded run, every `error:`, and `compare`'s table still print, because those are news rather than narration. Refused next to `-v`. |
 | `compare <BASE> <CURRENT>` | — | The second mode: reads two `.folded` files, prints the functions whose cost moved, biggest move first. |
 
 `--help` prints these with their long-form notes and the exit-code table; `-h` is the short version;
@@ -121,6 +122,90 @@ never `file:line`. Build the copy you profile with a profiling profile — `[pro
 is the profile whose output gets deployed, and mainnet bills for the extra bytes.
 no function recorded any exclusive cost (cpu)
 ```
+
+### Three output formats
+
+`--format` chooses how the run's result is serialized. Three values, three different questions:
+
+| `--format` | Writes | Default file | For |
+|---|---|---|---|
+| `folded` (default) | the call tree, one line per stack path | `profile.folded` | speedscope.app, `flamegraph.pl`, `compare` |
+| `json` | the call tree as structured data | `profile.json` | a script or CI job that walks frames |
+| `raw` | the event stream, one line per recorded event | `profile.raw` | finding out what the engine actually reported |
+
+The name follows the format when `--output` is omitted, because the three are not interchangeable
+downstream: `compare` reads collapsed stacks and would call a JSON document malformed on its first line.
+
+`json` carries the two things a stack path cannot: which `--metric` the counts are denominated in, and
+`file:line` per frame.
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy --format json
+no function recorded any exclusive cost (cpu)
+$ cat profile.json
+{
+  "metric": "cpu",
+  "root": {
+    "children": [],
+    "exclusive": {
+      "cpu": 0,
+      "hostcalls": 0,
+      "memory": 0
+    },
+    "file": null,
+    "function": "wasm[0]",
+    "inclusive": {
+      "cpu": 0,
+      "hostcalls": 0,
+      "memory": 0
+    },
+    "line": null
+  }
+}
+```
+
+`"metric"` is the field a `.folded` file has nowhere to put, which is why both sides of a `compare` have to
+agree on `--metric` in advance and nothing can check it afterwards. `"file"` and `"line"` are `null` here
+because this fixture's frames arrive with no program counter — see
+[Every frame lands at `wasm[0]`](#every-frame-lands-at-wasm0). `"children"` is an array sorted by function
+name and never a map's iteration order, so two runs of one contract write byte-identical JSON and a diff of
+the artifact says something about the contract instead of about the allocator.
+
+`raw` is stage 1's output: `kind pc=<n> cpu=<n> mem=<n>` per event, before symbolization and before the tree
+is built. It takes no `--metric` — each event carries its own cpu and memory deltas, unselected — and prints
+no ranking, because nothing was aggregated. It is also the one format that never warns about debug info: the
+symbolization stage is not run at all, since the format has no field a name could go in, so #186's `warning:`
+on a stripped binary would be advice about a column that does not exist.
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy --format raw
+2 trace events written to profile.raw
+$ cat profile.raw
+call pc=0 cpu=0 mem=0
+return pc=0 cpu=0 mem=0
+```
+
+Those two lines are the whole of what the engine reports for this call, and therefore the reason the profile
+is one frame of zeros: a `call` and a `return`, no program counter, nothing between them. The same run at
+`--sample-rate 1` writes **four** events across the same two boundaries — two `step` lines appear between
+them, each `cpu=1` — because call and return are emitted unconditionally while steps are what the throttle
+controls. That pair, read straight off the artifact, is
+[the counts-are-boundary-counts finding](#the-counts-are-boundary-counts-not-instructions) with no prose
+attached to it.
+
+`--output -` sends the artifact to stdout and prints nothing else, which is how a profile becomes a pipe
+stage instead of a file:
+
+```console
+$ soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy \
+    --format json --output - | jq .metric
+"cpu"
+```
+
+The summary stays silent there because two documents in one stream parse as neither; warnings, errors and the
+exit code are unchanged. `-` is a convention and not a file — no file named `-` appears. A run that traps while
+writing to a stream says so about the stream (`The partial trace up to the trap is on stdout`), and a refused
+write names the document it was attempting (`failed to write JSON call tree to …`).
 
 ### What the two streams are for
 
@@ -389,7 +474,7 @@ is now a flag — `--instruction-limit`, [#213](https://github.com/Tollcraft/sor
 which runs once per boundary —
 so the counter advances per boundary, not per instruction. A contract that loops forever *inside* one
 function body emits no boundaries, never advances the counter, and is not stopped; `wasmi`'s own fuel is set
-to `u64::MAX` for the run (`src/main.rs:404-406`), so the engine does not stop it either.
+to `u64::MAX` for the run (`src/main.rs:505-510`), so the engine does not stop it either.
 
 This is the sharpest edge in the tool, and it is the one place where the roadmap's
 "Infinite Loop Protection" box reads more strongly than the current engine can deliver — `ROADMAP.md` now

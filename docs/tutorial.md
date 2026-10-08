@@ -295,7 +295,7 @@ Cost comparison, baseline → current (exclusive cost per function):
 Rows are ranked by the size of the move. The last row is `total`, the **whole-profile sum**, which is the
 number you actually asked for — and here it collides with the export in step 2, which is also called `total`
 and is *not* what that row is: the two files above contain one frame each, `wasm[0]`, and `total` is the sum
-row beneath them (`src/formatter.rs:370-371`). Functions that did not move are left out of the table but
+row beneath them (`src/formatter.rs:474-475`). Functions that did not move are left out of the table but
 counted in the tally line, so an empty table cannot be mistaken for a broken one, and a regression still exits
 `0` — bad news is still an answer. One thing to watch: a `.folded` file records no metric of its own, so both
 sides of a `compare` have to come from runs that agreed on `--metric` already. Nothing can check that for you.
