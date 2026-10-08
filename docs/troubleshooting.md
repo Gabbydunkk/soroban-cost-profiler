@@ -8,10 +8,11 @@ cargo build --release
 ./target/release/soroban-cost-profiler --wasm fixtures/dwarf_probe/dwarf_probe.wasm --fn caller_of_heavy
 ```
 
-Two of the reproductions need a module the committed fixtures do not contain — one that imports a host
-function, whose 52 bytes this repository already commits as test data, and one whose export takes an argument.
-Those entries say which module they ran and give its text format, rather than pretending a fixture produced
-them.
+Three of the reproductions need a module the committed fixtures do not contain — one that imports a host
+function, one whose export takes an `i64`, and one whose export takes an `i32`. All three are hand-assembled
+test data in this repository (`NEEDS_HOST`, `NEEDS_ARG` and `NEEDS_I32` in `src/main.rs`, at 52, 46 and 43
+bytes), and the entries below say which one they ran and give its text format, rather than pretending a
+fixture produced them.
 
 ## What is broken and what is working as designed
 
@@ -31,7 +32,7 @@ from any command line:
 | `unsymbolized 0` | The trace recorded no boundary at all | [`unsymbolized` frames](#the-file-says-unsymbolized) |
 | A warning about `.debug_info` or `name` | Symbol degraded, run fine — pick which of the three | [Unnamed frames](#frames-are-named-by-address-not-source) |
 | `failed to instantiate module: cannot find definition for import` | A real `soroban-sdk` contract; blocked on #210 | [Host imports](#a-contract-that-imports-host-functions-does-not-run) |
-| `trapped: encountered an incorrect number of parameters` | The export takes arguments; blocked on #211 | [Arguments](#the-export-takes-arguments) |
+| `takes 1 argument (i64); --args gave no values` | The export takes parameters; pass them with `--args` | [Arguments](#the-export-takes-arguments) |
 | `Instruction ceiling exceeded` | The trace-buffer guard tripped at your `--instruction-limit` | [The ceiling](#about-the-100m-instruction-limit) |
 | No records on stderr when you want them | The default level prints none; `-v` installs the transcript | [What the profiler is doing](#i-want-to-see-what-the-profiler-is-doing) |
 | `--quiet` prints nothing on stdout and exits `0` | The flag's whole job: the artifact is the answer | [`--quiet`](#--quiet-printed-nothing-is-that-a-failure) |
@@ -217,25 +218,65 @@ pure-computation exports.
 ## The export takes arguments
 
 Again not a fixture: a module whose single export takes an argument,
-`(module (func (export "needs_arg") (param i64) (result i32) local.get 0 drop i32.const 42))`, encoded as
-`needs_arg.wasm`:
+`(module (func (export "needs_arg") (param i64) (result i64) local.get 0 i64.const 2 i64.add))`, encoded as
+`needs_arg.wasm`. The flag for it is `--args`, and the first thing to notice is that getting it wrong is not
+a trap:
 
 ```console
 $ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --output na.folded
-error: 'needs_arg' trapped: encountered an incorrect number of parameters. The partial trace up to the trap
-is in na.folded, and its costs are incomplete because the call never returned.
+error: 'needs_arg' takes 1 argument (i64); --args gave no values. `--args` is one value per parameter, in
+the order the signature lists them.
 $ echo $?
 1
+$ ls na.folded
+ls: na.folded: No such file or directory
+
+$ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --args 40 --output na.folded
+no function recorded any exclusive cost (cpu)
+$ echo $?
+0
+$ cat na.folded
+wasm[0] 0
 ```
 
-**Why.** The profiler invokes the export with an empty parameter list, so any export that takes arguments
-traps on entry. This is the arity trap, not a panic in your contract.
+The second command prints a `warning:` line about this module's missing `.debug_info` too, elided here
+because the interesting half is the exit code and the file.
 
-**What to do.** Profile an export that takes none. The trap path still writes the partial trace it earned —
-that is #173's requirement that a panicking contract yields a flamegraph up to the point it stopped — which
-is why `na.folded` exists here and holds `unsymbolized 0`. Passing real values is
-[`--args`, issue 211](https://github.com/Tollcraft/soroban-cost-profiler/issues/211); reading ledger state is
-[issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212).
+**Why.** The profiler reads the export's signature off the module and checks `--args` against it *before*
+invoking anything, so an arity mistake is a bad command line and not a run. It used to be a run: the same
+first command printed `'needs_arg' trapped: encountered an incorrect number of parameters`, exited `1`, and
+left an `na.folded` beside it. #173's rule is that a trapping contract keeps the trace it earned, and that
+rule is right for a contract that stopped halfway through — it is wrong for a call that was never legal,
+which is the artifact the old behaviour wrote.
+[Issue 211](https://github.com/Tollcraft/soroban-cost-profiler/issues/211) moved the check in front of the
+call so the refusal writes nothing.
+
+**What to do.** Count the parameters the message names and pass that many values, comma-separated, in the
+order the signature lists them: `--args 1000,7`. A negative amount is a value, not a flag (`--args -1`
+parses). Two limits the flag does not paper over:
+
+* **The values are `i64`.** A parameter of another width is named by position and type rather than coerced.
+  Against a 43-byte module whose export is `(param i32) (result i32)`:
+
+  ```console
+  $ soroban-cost-profiler --wasm needs_i32.wasm --fn needs_i32 --args 1
+  error: 'needs_i32' takes 1 argument (i32), and `--args` supplies i64 values only: argument 1 is i32. A
+  parameter of another width cannot be named from the command line.
+  ```
+
+  The boundary an SDK export declares *is* `i64` — measured on the `fixtures/build.sh` artifact, whose
+  `compute_heavy_loop` is `(i64) -> i64` and whose host imports are `i64` in and out — so `--args` can satisfy
+  the arity of a real contract's export. What it cannot do is give that number a meaning: the word is a
+  handle into a host the profiler does not link, which is
+  [#210](https://github.com/Tollcraft/soroban-cost-profiler/issues/210) and
+  [#212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212) rather than a flag.
+* **Arguments are values, not state.** Nothing here gives the contract a ledger to read; that is
+  [issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212).
+
+Both refusals exit `1` and write no file, for the same reason the host-import entry above does: a command
+line that cannot be honoured should not leave behind an artifact that looks like it was. A value `--args`
+cannot parse at all — `--args abc` — is clap's refusal instead of the profiler's, and is in
+[Refused flags](#refused-flags).
 
 ## The export name is wrong
 
@@ -275,7 +316,7 @@ rebuild it.
 ## The output path is wrong, and which exit code it earns
 
 Exit codes are the documented `0` success, `1` "the invocation could not be honoured as asked", `2` "the
-input was accepted and the profiler could not finish its own work" (`src/main.rs:333-358` splits these two on
+input was accepted and the profiler could not finish its own work" (`src/main.rs:430-449` splits these two on
 the error kind, so a path you could never have written to is `1` and a machine refusing a write is `2`):
 
 ```console
@@ -337,6 +378,9 @@ $ soroban-cost-profiler --wasm contract.wasm --fn call --format yaml
 error: invalid value 'yaml' for '--format <FORMAT>'
   [possible values: folded, json, raw]
 
+$ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --args abc
+error: invalid value 'abc' for '--args <ARGS>': invalid digit found in string
+
 $ soroban-cost-profiler --wasm contract.wasm --fn call -v --quiet
 error: the argument '--verbose...' cannot be used with '--quiet'
 $ echo $?
@@ -355,6 +399,12 @@ instead of dying later with no explanation.
 `-v` and `--quiet` are refused as a pair for a third reason: they state opposite intentions about the same
 output, and clap picking a winner would leave the user reading a transcript their own command line did not
 ask for.
+
+`--args abc` is the same class of refusal as `--metric gas`: the value is not what the flag's type declares,
+and clap says so with the token it could not read. The two `--args` refusals that are *not* clap's — the
+wrong number of values, and a parameter that is not `i64` — come from the module's own signature and are in
+[The export takes arguments](#the-export-takes-arguments), because the fix there is a different command line
+rather than a different value.
 
 ## I want to see what the profiler is doing
 
@@ -452,6 +502,9 @@ the exit code is still `1` — a halved stream on stdout is a truncated profile 
 $ soroban-cost-profiler --wasm contract.wasm --fn call compare before.folded after.folded
 error: `compare` reads two .folded files and runs no contract, so `--wasm` cannot accompany it.
 
+$ soroban-cost-profiler --args 1000,7 compare before.folded after.folded
+error: `compare` reads two .folded files and runs no contract, so `--args` cannot accompany it.
+
 $ soroban-cost-profiler compare ok.folded .
 error: failed to read .: Is a directory (os error 21)
 
@@ -459,7 +512,10 @@ $ soroban-cost-profiler compare junk.folded ok.folded
 error: baseline: line 1: expected a non-negative integer cost, got "notanumber"
 ```
 
-**What to do.** Drop `--wasm` and the profiling flags: `compare` takes two files and nothing else. Name a
+**What to do.** Drop `--wasm` and the profiling flags: `compare` takes two files and nothing else. The
+values flag is refused for the same reason as the contract — arguments are for a call and this mode makes
+none — and written *after* the subcommand it is clap's refusal instead of ours, `error: unexpected argument
+'--args' found`, because `compare` declares only its two files. Both exit `1`. Name a
 `.folded`, not a directory and not a contract — handing it a `.wasm` is the most common form of this failure,
 and the error is `failed to read <file>: stream did not contain valid UTF-8`. The parse errors name which
 side and which line (`baseline:` or `current:`), because the two files come from different runs and the
@@ -503,7 +559,7 @@ does not say, and a reader should know before trusting it:
   which runs once per boundary (`src/tracer.rs:356-360`), and one host-initiated call gives two of them —
   which is why `1` halts a function that computes a million instructions and `2` lets it finish. A contract
   that loops forever *inside* one function body emits no boundaries, never advances the counter, and is not
-  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:505-510`), so the engine
+  stopped — and `wasmi`'s own fuel is set to `u64::MAX` for the run (`src/main.rs:606-610`), so the engine
   does not stop it either.
 
 So if your symptom is "it hangs" or "my machine ran out of memory", the ceiling message is not the diagnosis,

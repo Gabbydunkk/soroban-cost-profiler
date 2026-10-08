@@ -35,7 +35,7 @@ use soroban_cost_profiler::tracer::{
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tracing::level_filters::LevelFilter;
-use wasmi::{ExternType, Val};
+use wasmi::{ExternType, Val, ValType};
 
 /// `value_parser` for `--sample-rate`: accept a positive count, refuse everything else.
 ///
@@ -93,8 +93,8 @@ fn parse_positive_u64(s: &str) -> Result<u64, String> {
     author,
     version,
     about,
-    long_about = "soroban-cost-profiler traces one exported function of a compiled Soroban contract and says where its cost went.\n\nTwo modes:\n  profile   --wasm <contract.wasm> --fn <export> runs that export under the instrumented engine and writes its profile to --output, in whatever shape --format picks: collapsed stacks (the default), a JSON call tree, or the raw event stream. The name defaults to the format — profile.folded, profile.json, profile.raw — and `-` sends the artifact to stdout instead of a file. Frames are named from the binary's own DWARF line tables when it has them; a binary built without debug info still profiles, and the run then says so on stderr instead of pretending its `wasm[pc]` frames are source lines.\n  compare   compare <base.folded> <new.folded> reads two profiles already on disk and prints the functions whose cost moved, biggest move first. It runs no contract, so it needs no --wasm.\n\nThe .folded file is the artifact. Open it in speedscope.app, or hand it to flamegraph.pl for a picture; this tool writes text and no SVG. `--format json` is the same tree for a program that walks it, and `--format raw` is the trace before any of it was named or folded. The terminal summary is a glance at the same run, not a second source of truth.\n\nExit codes:\n  0  the run was honoured as asked; a compare that reports a regression still exits 0, because bad news is still an answer\n  1  the invocation could not be honoured as asked: a contract that cannot be read, parsed or linked, an export the module does not have, a contract that trapped, a .folded file that is missing or malformed, or a refused flag\n  2  the input was accepted and the profiler could not finish its own work: a write the machine refused for a reason other than the path, or an engine that would not configure",
-    after_help = "Examples:\n  # profile the `call` export\n  soroban-cost-profiler --wasm target/wasm32-unknown-unknown/release/contract.wasm --fn call\n\n  # the same run in memory units, into a named file\n  soroban-cost-profiler --wasm contract.wasm --fn call --metric memory --output memory.folded\n\n  # the call tree as structured data, straight into jq\n  soroban-cost-profiler --wasm contract.wasm --fn call --format json --output -\n\n  # what the engine actually reported: one line per recorded event\n  soroban-cost-profiler --wasm contract.wasm --fn call --format raw --sample-rate 1\n\n  # a denser trace: one event every 100 rather than every 1000\n  soroban-cost-profiler --wasm contract.wasm --fn call --sample-rate 100\n\n  # a heavier contract than the default bound allows\n  soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 200000000\n\n  # did the change help?\n  soroban-cost-profiler compare before.folded after.folded",
+    long_about = "soroban-cost-profiler traces one exported function of a compiled Soroban contract and says where its cost went.\n\nTwo modes:\n  profile   --wasm <contract.wasm> --fn <export> runs that export under the instrumented engine and writes its profile to --output, in whatever shape --format picks: collapsed stacks (the default), a JSON call tree, or the raw event stream. The name defaults to the format — profile.folded, profile.json, profile.raw — and `-` sends the artifact to stdout instead of a file. `--args 1000,7` passes values to an export that takes parameters. Frames are named from the binary's own DWARF line tables when it has them; a binary built without debug info still profiles, and the run then says so on stderr instead of pretending its `wasm[pc]` frames are source lines.\n  compare   compare <base.folded> <new.folded> reads two profiles already on disk and prints the functions whose cost moved, biggest move first. It runs no contract, so it needs no --wasm.\n\nThe .folded file is the artifact. Open it in speedscope.app, or hand it to flamegraph.pl for a picture; this tool writes text and no SVG. `--format json` is the same tree for a program that walks it, and `--format raw` is the trace before any of it was named or folded. The terminal summary is a glance at the same run, not a second source of truth.\n\nExit codes:\n  0  the run was honoured as asked; a compare that reports a regression still exits 0, because bad news is still an answer\n  1  the invocation could not be honoured as asked: a contract that cannot be read, parsed or linked, an export the module does not have, a contract that trapped, a .folded file that is missing or malformed, or a refused flag\n  2  the input was accepted and the profiler could not finish its own work: a write the machine refused for a reason other than the path, or an engine that would not configure",
+    after_help = "Examples:\n  # profile the `call` export\n  soroban-cost-profiler --wasm target/wasm32-unknown-unknown/release/contract.wasm --fn call\n\n  # the same run in memory units, into a named file\n  soroban-cost-profiler --wasm contract.wasm --fn call --metric memory --output memory.folded\n\n  # the call tree as structured data, straight into jq\n  soroban-cost-profiler --wasm contract.wasm --fn call --format json --output -\n\n  # what the engine actually reported: one line per recorded event\n  soroban-cost-profiler --wasm contract.wasm --fn call --format raw --sample-rate 1\n\n  # an export that takes arguments\n  soroban-cost-profiler --wasm contract.wasm --fn transfer --args 1000,7\n\n  # a denser trace: one event every 100 rather than every 1000\n  soroban-cost-profiler --wasm contract.wasm --fn call --sample-rate 100\n\n  # a heavier contract than the default bound allows\n  soroban-cost-profiler --wasm contract.wasm --fn call --instruction-limit 200000000\n\n  # did the change help?\n  soroban-cost-profiler compare before.folded after.folded",
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
@@ -131,6 +131,22 @@ pub struct Cli {
     /// not: an empty `--fn` is refused at the run, not by clap.
     #[arg(long = "fn", default_value = "", hide_default_value = true)]
     pub fn_name: String,
+
+    /// Arguments for the export, comma-separated: `--args 1000,7`
+    ///
+    /// A contract's wasm export takes each parameter as an `i64` — the SDK's `Val` is a 64-bit word
+    /// at that boundary — so an export declared `(param i64) (param i64)` wants two numbers here, in
+    /// the order its signature lists them. The count and the types are checked against that
+    /// signature before the call, so a mismatch names the export's real parameters instead of
+    /// arriving as `wasmi`'s `encountered an incorrect number of parameters` trap, which cannot say
+    /// what it wanted.
+    ///
+    /// Only integers are accepted, and they are handed over as raw `i64` words. That is enough for an
+    /// `extern "C"` export taking `u64`/`i64`, and it is not enough for an SDK entry point whose
+    /// arguments are object or ledger-heap handles: decoding those needs a host to build them in,
+    /// which is issue 210 and issue 212, not this flag.
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+    pub args: Vec<i64>,
 
     /// Record one trace event every N instructions (must be greater than 0)
     #[arg(long, default_value_t = 1000, value_parser = parse_positive_u32)]
@@ -464,8 +480,91 @@ struct TargetRun {
     trapped: Option<String>,
 }
 
-/// Stage 1, executed: instantiate `wasm_bytes`, invoke `fn_name`, and hand back the trace it
-/// produced next to the function's own return values.
+/// What a wasm parameter type is called in a message a user reads.
+///
+/// `wasmi` gives `ValType` no `Display`, and its own error text for a mismatch is a debug format
+/// (`I64`), which is not how anyone writes a contract signature.
+fn val_type_name(ty: &ValType) -> &'static str {
+    match ty {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        ValType::V128 => "v128",
+        ValType::FuncRef => "funcref",
+        ValType::ExternRef => "externref",
+    }
+}
+
+/// `(i64, i64)` for the export's parameter list, `no arguments` for an export that takes none.
+fn describe_parameters(params: &[ValType]) -> String {
+    if params.is_empty() {
+        return String::from("no arguments");
+    }
+    let types: Vec<&str> = params.iter().map(val_type_name).collect();
+    format!(
+        "{} {} ({})",
+        params.len(),
+        if params.len() == 1 {
+            "argument"
+        } else {
+            "arguments"
+        },
+        types.join(", ")
+    )
+}
+
+/// Check `--args` against the export's own signature, before the call is made (#211).
+///
+/// Two failures, because they are two different mistakes. The count is the one a user makes by
+/// hand — a forgotten value, or one too many — and the fix is in the message: what the export
+/// wants, spelled from its type. The *type* is the one this tool cannot fix: `--args` speaks `i64`
+/// only, so an export with an `i32` or `f64` parameter is refused rather than invoked with a
+/// value whose width the engine will reject as a trap.
+///
+/// Checked here rather than left to `wasmi` because the engine's answer is
+/// `encountered an incorrect number of parameters` — true, and useless, since it names neither
+/// the signature nor what was passed — and because it arrives as a *trap*, which #173's path then
+/// reports as a partial profile of a call that was never legal to make.
+fn check_target_arguments(fn_name: &str, params: &[ValType], args: &[Val]) -> Result<(), Failure> {
+    if params.len() != args.len() {
+        let given = if args.is_empty() {
+            String::from("--args gave no values")
+        } else {
+            format!(
+                "--args gave {} {}",
+                args.len(),
+                if args.len() == 1 { "value" } else { "values" }
+            )
+        };
+        return Err(Failure::Input(format!(
+            "'{fn_name}' takes {}; {given}. `--args` is one value per parameter, in the order the \
+             signature lists them.",
+            describe_parameters(params)
+        )));
+    }
+    if let Some((index, ty)) = params
+        .iter()
+        .enumerate()
+        .find(|(_, ty)| !matches!(ty, ValType::I64))
+    {
+        return Err(Failure::Input(format!(
+            "'{fn_name}' takes {}, and `--args` supplies i64 values only: argument {} is {}. \
+             A parameter of another width cannot be named from the command line.",
+            describe_parameters(params),
+            index + 1,
+            val_type_name(ty)
+        )));
+    }
+    Ok(())
+}
+
+/// Stage 1, executed: instantiate `wasm_bytes`, invoke `fn_name` with `args`, and hand back the
+/// trace it produced next to the function's own return values.
+///
+/// `args` is what `--args` became (#211), and an export that takes no parameters is called with an
+/// empty slice — the same shape every run had before the flag existed. It is checked against the
+/// export's signature here rather than at the flag, because only the module knows the signature.
 ///
 /// The values are part of this function's contract because the trace cannot prove a run happened.
 /// `wasmi` 2.0's call hook reports no program counter and no fuel, so every boundary it records
@@ -489,6 +588,7 @@ fn run_target(
     wasm_bytes: &[u8],
     fn_name: &str,
     tracer: ExecutionTracer,
+    args: &[Val],
 ) -> Result<TargetRun, Failure> {
     let engine = setup_engine();
     let module = parse_module(&engine, wasm_bytes)
@@ -516,10 +616,12 @@ fn run_target(
 
     // Sized and typed from the signature: a contract returning `u64` gets an `I64` slot, and a
     // void one runs on an empty buffer.
-    let mut results: Vec<Val> = instance
+    let export = instance
         .get_func(&store, fn_name)
-        .ok_or_else(|| Failure::Input(unknown_export(fn_name, &module)))?
-        .ty(&store)
+        .ok_or_else(|| Failure::Input(unknown_export(fn_name, &module)))?;
+    let signature = export.ty(&store);
+    check_target_arguments(fn_name, signature.params(), args)?;
+    let mut results: Vec<Val> = signature
         .results()
         .iter()
         .map(|ty| Val::default_for_ty(*ty))
@@ -527,7 +629,7 @@ fn run_target(
 
     // A trap leaves `results` untouched — the function never returned — so the run reports no
     // values and names the trap, while the events recorded up to the trap go to aggregation.
-    let trapped = invoke_function(&mut store, &instance, fn_name, &[], &mut results)
+    let trapped = invoke_function(&mut store, &instance, fn_name, args, &mut results)
         .err()
         .map(|error| error.to_string());
     let values = if trapped.is_some() {
@@ -578,7 +680,8 @@ fn profile(cli: &Cli) -> Result<(), Failure> {
     })?;
     let wasm_bytes = load_wasm_file(&wasm.to_string_lossy())
         .map_err(|error| Failure::Input(format!("failed to read {}: {error}", wasm.display())))?;
-    let run = run_target(&wasm_bytes, &cli.fn_name, initialize_tracer(cli))?;
+    let args: Vec<Val> = cli.args.iter().copied().map(Val::I64).collect();
+    let run = run_target(&wasm_bytes, &cli.fn_name, initialize_tracer(cli), &args)?;
     let destination = artifact_destination(cli);
 
     // The artifact, and the one line the terminal adds about it. Two branches because `raw` has no
@@ -677,12 +780,19 @@ fn compare(baseline: &Path, current: &Path) -> Result<(), Failure> {
 /// `--wasm` beside `compare` is refused instead of ignored. Either flag on its own says what to do;
 /// both together say two things, and the only honest answers are "run the contract and ignore the
 /// files" or "read the files and ignore the contract" — the tool should not pick one silently.
+/// `--args` is the same shape (#211): values only mean something to a call, and `compare` makes none.
 fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Some(Command::Compare { baseline, current }) => {
             if cli.wasm.is_some() {
                 return Err(Failure::Input(String::from(
                     "`compare` reads two .folded files and runs no contract, so `--wasm` cannot \
+                     accompany it.",
+                )));
+            }
+            if !cli.args.is_empty() {
+                return Err(Failure::Input(String::from(
+                    "`compare` reads two .folded files and runs no contract, so `--args` cannot \
                      accompany it.",
                 )));
             }
@@ -800,11 +910,25 @@ mod tests {
     /// `3 * i` for `i < 1000`, the second sums `7 * i` for `i < 64`.
     const CALLER_OF_HEAVY: i64 = 1_512_612;
 
+    /// `(module (func (export "needs_arg") (param i64) (result i64) local.get 0 i64.const 2 i64.add))`.
+    ///
+    /// #211's subject at 46 bytes: an export whose signature has a parameter, hand-assembled for the
+    /// same reason `BOOM` and `NEEDS_HOST` are (`source_map.rs` set the precedent) — the committed
+    /// fixtures have no parameterized export, and a `wasm32` build is not available to the test job.
+    /// The body returns `argument + 2`, so the return value says whether the value passed in actually
+    /// arrived.
+    const NEEDS_ARG: &[u8] = b"\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x06\x01\x60\x01\x7e\x01\x7e\x03\x02\x01\x00\x07\x0d\x01\x09\x6e\x65\x65\x64\x73\x5f\x61\x72\x67\x00\x00\x0a\x09\x01\x07\x00\x20\x00\x42\x02\x7c\x0b";
+
+    /// The same shape with `(param i32) (result i32)`, for the refusal that is about *width* rather
+    /// than count: `--args` can name an `i64` and nothing else.
+    const NEEDS_I32: &[u8] = b"\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x06\x01\x60\x01\x7f\x01\x7f\x03\x02\x01\x00\x07\x0d\x01\x09\x6e\x65\x65\x64\x73\x5f\x69\x33\x32\x00\x00\x0a\x06\x01\x04\x00\x20\x00\x0b";
+
     fn cli(output: PathBuf, wasm: PathBuf, fn_name: &str) -> Cli {
         Cli {
             wasm: Some(wasm),
             output: Some(output),
             fn_name: fn_name.into(),
+            args: Vec::new(),
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
@@ -821,6 +945,7 @@ mod tests {
             wasm: None,
             output: Some(PathBuf::from("unused.folded")),
             fn_name: String::new(),
+            args: Vec::new(),
             sample_rate: 1000,
             instruction_limit: 100_000_000,
             metric: Metric::Cpu,
@@ -851,7 +976,7 @@ mod tests {
     /// the number the contract computes rather than the shape of the trace.
     #[test]
     fn the_named_export_is_invoked_and_its_result_returned() {
-        let run = run_target(FIXTURE, "caller_of_heavy", tracer()).unwrap();
+        let run = run_target(FIXTURE, "caller_of_heavy", tracer(), &[]).unwrap();
         assert!(
             matches!(run.values.as_slice(), [Val::I64(value)] if *value == CALLER_OF_HEAVY),
             "the run must return the value the contract computes, got {:?}",
@@ -865,9 +990,110 @@ mod tests {
         );
     }
 
+    /// #211's "done" line: an export that takes parameters runs, when the parameters are given.
+    ///
+    /// The assertion is on the **returned number**, not the exit code or the trace, because `40 + 2`
+    /// can only come out of a body that read its argument. A test that stopped at "exit 0" would also
+    /// pass if the value were dropped and the engine handed the function a zero.
+    #[test]
+    fn the_argument_reaches_the_contract_and_the_answer_comes_back() {
+        let run = run_target(NEEDS_ARG, "needs_arg", tracer(), &[Val::I64(40)]).unwrap();
+        assert!(run.trapped.is_none(), "{:?}", run.trapped);
+        assert!(
+            matches!(run.values.as_slice(), [Val::I64(value)] if *value == 42),
+            "needs_arg(40) is 40 + 2, got {:?}",
+            run.values
+        );
+    }
+
+    /// The failure this issue was filed about, and the one the docs quote: no `--args` against a
+    /// one-parameter export. It used to be `wasmi`'s trap, which arrived as a *profile* of a call that
+    /// was never legal (`encountered an incorrect number of parameters`, exit 1, and a partial
+    /// `.folded` beside it). Now the signature check refuses it before the call and names the
+    /// parameter type the module actually declares.
+    #[test]
+    fn a_missing_argument_is_refused_with_the_exports_signature() {
+        let error = input_failure(run_target(NEEDS_ARG, "needs_arg", tracer(), &[]).unwrap_err());
+        assert!(
+            error.contains("'needs_arg' takes 1 argument (i64)")
+                && error.contains("--args gave no values"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("incorrect number of parameters"),
+            "the engine's trap text must not be what the user is left with: {error}"
+        );
+    }
+
+    #[test]
+    fn an_extra_argument_is_refused_the_same_way() {
+        let args = [Val::I64(1), Val::I64(2)];
+        let error = input_failure(run_target(NEEDS_ARG, "needs_arg", tracer(), &args).unwrap_err());
+        assert!(
+            error.contains("takes 1 argument (i64)") && error.contains("--args gave 2 values"),
+            "{error}"
+        );
+    }
+
+    /// The other direction: an export that takes nothing, given something. The plural agreement is
+    /// asserted because this is prose a person reads to decide what to retype.
+    #[test]
+    fn an_export_with_no_parameters_says_so_rather_than_the_count_it_wanted() {
+        let error = input_failure(
+            run_target(FIXTURE, "caller_of_heavy", tracer(), &[Val::I64(1)]).unwrap_err(),
+        );
+        assert!(
+            error.contains("takes no arguments") && error.contains("--args gave 1 value"),
+            "{error}"
+        );
+    }
+
+    /// `--args` speaks `i64` only, so a parameter of another width is a refusal rather than a trap.
+    /// Naming the position and the type is the whole point: `(param i32)` is invisible in a binary the
+    /// user cannot read, and `wasmi`'s own complaint is a type mismatch inside a trap.
+    #[test]
+    fn a_parameter_of_another_width_is_named_by_position_and_type() {
+        let error = input_failure(
+            run_target(NEEDS_I32, "needs_i32", tracer(), &[Val::I64(1)]).unwrap_err(),
+        );
+        assert!(
+            error.contains("takes 1 argument (i32)")
+                && error.contains("argument 1 is i32")
+                && error.contains("i64 values only"),
+            "{error}"
+        );
+    }
+
+    /// The flag itself: `--args 1000,7` is a list, `-1` is a value rather than a flag, and the flag
+    /// may be repeated. Through `parse`, so the test fails if the *command line* stops working rather
+    /// than if only a helper changes.
+    #[test]
+    fn the_args_flag_is_a_comma_separated_list_of_64_bit_values() {
+        assert_eq!(parse(&["--args", "1000,7"]).unwrap().args, vec![1000, 7]);
+        assert_eq!(
+            parse(&["--args", "-1,2"]).unwrap().args,
+            vec![-1, 2],
+            "a negative amount is a value, not a flag"
+        );
+        assert_eq!(
+            parse(&["--args", "1", "--args", "2,3"]).unwrap().args,
+            vec![1, 2, 3]
+        );
+        assert!(
+            parse(&[]).unwrap().args.is_empty(),
+            "omitting the flag changes nothing"
+        );
+
+        let text = clap_error(&["--args", "abc"]).render().to_string();
+        assert!(
+            text.contains("--args"),
+            "the refusal names the flag: {text}"
+        );
+    }
+
     #[test]
     fn an_unknown_fn_names_the_functions_the_module_does_export() {
-        let error = input_failure(run_target(FIXTURE, "compute_heavy", tracer()).unwrap_err());
+        let error = input_failure(run_target(FIXTURE, "compute_heavy", tracer(), &[]).unwrap_err());
         assert!(
             error.contains("caller_of_heavy") && error.contains("memory_heavy_loop"),
             "{error}"
@@ -878,7 +1104,7 @@ mod tests {
     /// which failed silently. Not knowing which export to profile is not a runnable default.
     #[test]
     fn an_empty_fn_name_is_an_error_rather_than_a_guess() {
-        let error = input_failure(run_target(FIXTURE, "", tracer()).unwrap_err());
+        let error = input_failure(run_target(FIXTURE, "", tracer(), &[]).unwrap_err());
         assert!(error.starts_with("--fn is required"), "{error}");
     }
 
@@ -1382,7 +1608,7 @@ mod tests {
     /// `trapped` has to travel beside the events and be reported by the CLI.
     #[test]
     fn a_trapping_contract_keeps_its_partial_trace_and_reports_the_trap() {
-        let run = run_target(BOOM, "boom", tracer()).unwrap();
+        let run = run_target(BOOM, "boom", tracer(), &[]).unwrap();
         assert!(
             run.trapped.is_some(),
             "the run must record that it did not finish"
@@ -1640,6 +1866,23 @@ mod tests {
 
         let error = input_failure(run(&cli).unwrap_err());
         assert!(error.contains("--wasm"), "{error}");
+    }
+
+    /// #211's flag joins that refusal for the same reason: values are for a call, and `compare` makes
+    /// none. A flag the mode cannot honour has to say so, because `--args 1000,7 compare a b` reads like
+    /// an instruction and would otherwise be discarded without a word.
+    #[test]
+    fn arguments_beside_compare_are_refused_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = folded_file(&dir, "base.folded", "caller_of_heavy 100\n");
+        let current = folded_file(&dir, "new.folded", "caller_of_heavy 90\n");
+        let cli = Cli {
+            args: vec![1000, 7],
+            ..compare_cli(baseline, current)
+        };
+
+        let error = input_failure(run(&cli).unwrap_err());
+        assert!(error.contains("--args") && error.contains("compare"), "{error}");
     }
 
     /// Stage 4's own output is what `compare` consumes: two runs of the same contract differ by

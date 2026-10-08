@@ -80,6 +80,7 @@ soroban-cost-profiler compare before.folded after.folded
 |---|---|---|
 | `-w, --wasm <PATH>` | — | The compiled contract. Required for profiling; not accepted next to `compare`, which runs nothing. |
 | `--fn <EXPORT>` | — | The exported function to invoke. Profiling refuses to start without a name, and a name the module does not export is an error that lists the exports it does have. |
+| `--args <N,N>` | — | Values for that export's parameters, comma-separated and `i64` only: `--args 1000,7`. The count and widths are checked against the module's own signature before the call, so a mismatch is refused as a bad command line (`takes 1 argument (i64); --args gave no values`) rather than running as a trap that leaves a half-profile on disk. A parameter that is not `i64` cannot be named from the command line — see [Contracts that import the Soroban host do not run](#contracts-that-import-the-soroban-host-do-not-run). Refused next to `compare`, which makes no call to pass anything to. |
 | `-o, --output <PATH>` | the format's own name | Where the artifact is written, or `-` for stdout. Omit it and the name follows `--format`: `profile.folded`, `profile.json`, `profile.raw`. |
 | `--metric <METRIC>` | `cpu` | `cpu`, `memory` or `hostcalls`. Sets what the counts in the file are denominated in; a `.folded` file does not record which, so both sides of a `compare` must have agreed on this flag beforehand. `--format json` writes the metric into the document; `--format raw` ignores it, because a trace event carries its cpu and memory deltas unselected. |
 | `--format <FORMAT>` | `folded` | `folded`, `json` or `raw` — how the run's result is serialized. See [Three output formats](#three-output-formats). |
@@ -415,23 +416,45 @@ does distinguish — wasm calls and host transitions.
 ### Contracts that import the Soroban host do not run
 
 Linked to the empty `Linker` (`src/tracer.rs:289`), this is the blocker the IMPORTANT note above points at,
-and it has two neighbours of the same kind, both measured on the built binary:
+and it has a neighbour of the same kind, both measured on the built binary:
 
-* **No arguments are passed.** The export is invoked with an empty parameter list, so a contract export that
-  takes arguments ends the run before it starts. Against a 43-byte `(func (export "needs_arg") (param i64)
-  (result i64))` module — whose no-debug warning is elided here, since the interesting half is the exit code:
-
-  ```console
-  $ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --output out.folded
-  error: 'needs_arg' trapped: encountered an incorrect number of parameters. The partial trace up to the
-  trap is in out.folded, and its costs are incomplete because the call never returned.
-  $ echo $?
-  1
-  ```
-
-  Passing values is [`--args` (issue 211)](https://github.com/Tollcraft/soroban-cost-profiler/issues/211).
 * **No ledger state.** There is no `--state`, no network and no snapshot, so anything reading storage has
   nothing to read — [issue 212](https://github.com/Tollcraft/soroban-cost-profiler/issues/212).
+
+Passing *values* is not one of them any more: `--args 1000,7` hands arguments to an export that takes
+parameters. Two things about it are worth knowing before a run looks wrong:
+
+The check happens **before** the call, against the module's own signature. This same 46-byte
+`(module (func (export "needs_arg") (param i64) (result i64) local.get 0 i64.const 2 i64.add))` module, with
+the no-debug warning elided because the interesting half is the exit code and whether a file appears:
+
+```console
+$ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --output out.folded
+error: 'needs_arg' takes 1 argument (i64); --args gave no values. `--args` is one value per parameter, in
+the order the signature lists them.
+$ echo $?
+1
+$ ls out.folded
+ls: out.folded: No such file or directory
+$ soroban-cost-profiler --wasm needs_arg.wasm --fn needs_arg --args 40 --output out.folded
+no function recorded any exclusive cost (cpu)
+$ echo $?
+0
+$ cat out.folded
+wasm[0] 0
+```
+
+Before [issue 211](https://github.com/Tollcraft/soroban-cost-profiler/issues/211) the first command was a
+*trap* — `encountered an incorrect number of parameters`, exit `1`, and an `out.folded` beside it. A profile
+of a call that was never legal is the worst artifact this tool can write, which is why the refusal is an
+input error and writes nothing.
+
+And the values are `i64`. A parameter of another width is named and refused rather than guessed at, so the
+flag cannot silently coerce `--args 1` into an `i32`. Note which half that leaves: an SDK build's exports
+*do* take `i64` — measured on the artifact `fixtures/build.sh` leaves, whose `compute_heavy_loop` is
+`(i64) -> i64` — so `--args 0` would satisfy that arity while naming a handle no host was ever built in.
+Those words only mean something once the linker and a ledger exist, which is #210 and #212 above rather than
+a flag this one can grow.
 
 One export per run is by design rather than a gap: a trace of a whole transaction is a different artifact
 from a profile of a function, and the file format already supports the nested case.
@@ -474,7 +497,7 @@ is now a flag — `--instruction-limit`, [#213](https://github.com/Tollcraft/sor
 which runs once per boundary —
 so the counter advances per boundary, not per instruction. A contract that loops forever *inside* one
 function body emits no boundaries, never advances the counter, and is not stopped; `wasmi`'s own fuel is set
-to `u64::MAX` for the run (`src/main.rs:505-510`), so the engine does not stop it either.
+to `u64::MAX` for the run (`src/main.rs:606-610`), so the engine does not stop it either.
 
 This is the sharpest edge in the tool, and it is the one place where the roadmap's
 "Infinite Loop Protection" box reads more strongly than the current engine can deliver — `ROADMAP.md` now

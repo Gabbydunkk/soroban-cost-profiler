@@ -45,6 +45,15 @@ const REAL_BUILD: &str = concat!(
 /// cannot reach another target's private items, and these bytes are test data, not logic.
 const NEEDS_HOST: &[u8] = b"\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x04\x01\x60\x00\x00\x02\x0f\x01\x03env\x07missing\x00\x00\x03\x02\x01\x00\x07\x08\x01\x04boom\x00\x01\x0a\x05\x01\x03\x00\x00\x0b";
 
+/// `(module (func (export "needs_arg") (param i64) (result i64) local.get 0 i64.const 2 i64.add))`.
+///
+/// #211's subject at 46 bytes: an export whose signature has a parameter, because none of the
+/// committed fixtures do and the test job has no wasm32 target — the same reason `NEEDS_HOST` is
+/// hand-assembled. The body returns `argument + 2`; that is what lets the in-process case in
+/// `src/main.rs` prove the value arrived, while what is observable *here* is that the call happens at
+/// all and writes an artifact.
+const NEEDS_ARG: &[u8] = b"\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x06\x01\x60\x01\x7e\x01\x7e\x03\x02\x01\x00\x07\x0d\x01\x09\x6e\x65\x65\x64\x73\x5f\x61\x72\x67\x00\x00\x0a\x09\x01\x07\x00\x20\x00\x42\x02\x7c\x0b";
+
 /// Run the built binary and capture everything a caller can see: code, stdout, stderr.
 fn profiler(args: &[&str]) -> Output {
     Command::new(PROFILER)
@@ -898,6 +907,112 @@ fn an_unknown_format_is_refused_and_names_the_ones_that_exist() {
     assert!(
         message.contains("--format") && message.contains("folded") && message.contains("raw"),
         "the refusal has to name the flag and the values it accepts: {message}"
+    );
+    assert!(
+        !Path::new(&output).exists(),
+        "a refused command line runs no contract and writes nothing"
+    );
+}
+
+/// #211's flag from outside the process, as the pair of runs that differ only by `--args`.
+///
+/// The half that is not about the happy path is the one that changed behaviour. Before the signature
+/// check, `needs_arg` with no argument was `wasmi`'s trap: exit 1, `encountered an incorrect number of
+/// parameters`, **and a `.folded` file left beside it** — a profile of a call that was never legal,
+/// which is the worst artifact this tool can produce. So both cases assert the absence or presence of
+/// the file, not only the exit code.
+#[test]
+fn an_export_that_takes_arguments_profiles_only_once_they_are_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let wasm = write_file(dir.path(), "needs_arg.wasm", NEEDS_ARG);
+    let output = dir
+        .path()
+        .join("profile.folded")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&["--wasm", &wasm, "--fn", "needs_arg", "--output", &output]);
+    code(&run, 1);
+    let message = stderr(&run);
+    assert!(
+        message.contains("'needs_arg' takes 1 argument (i64)")
+            && message.contains("--args gave no values"),
+        "the refusal has to state the export's own signature, got {message:?}"
+    );
+    assert!(
+        !message.contains("incorrect number of parameters"),
+        "the engine's trap text must not be what a user is left with: {message:?}"
+    );
+    assert!(
+        !Path::new(&output).exists(),
+        "a call that was never legal must not leave a profile behind"
+    );
+
+    let run = profiler(&[
+        "--wasm",
+        &wasm,
+        "--fn",
+        "needs_arg",
+        "--args",
+        "40",
+        "--output",
+        &output,
+    ]);
+    code(&run, 0);
+    // `wasm[0] 0`, byte-for-byte the artifact `caller_of_heavy` writes: this fixture has no line
+    // tables and `wasmi` 2.0 hands the hook no program counter, so what the flag proves is that the
+    // call *happened* — the value itself is asserted in `src/main.rs`, where the return is reachable.
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap_or_else(|error| panic!(
+            "with `--args 40` the export runs, so it must leave an artifact: {error}"
+        )),
+        "wasm[0] 0\n"
+    );
+    assert!(
+        stdout(&run).contains("no function recorded any exclusive cost"),
+        "the summary is still what tells the reader this zero is a zero: {:?}",
+        stdout(&run)
+    );
+
+    // Too many values is the same refusal, from the same place.
+    let run = profiler(&["--wasm", &wasm, "--fn", "needs_arg", "--args", "1,2"]);
+    code(&run, 1);
+    assert!(
+        stderr(&run).contains("--args gave 2 values"),
+        "the count given is as informative as the count wanted: {:?}",
+        stderr(&run)
+    );
+}
+
+/// A value `--args` cannot parse never reaches the engine. clap's own refusal names the flag and the
+/// offending text, exits with #183's input code, and leaves no artifact — the same shape as every
+/// other refused command line in this file, which is why it is pinned here rather than trusted to the
+/// flag's doc comment.
+#[test]
+fn an_argument_that_is_not_a_number_is_refused_by_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let wasm = write_file(dir.path(), "needs_arg.wasm", NEEDS_ARG);
+    let output = dir
+        .path()
+        .join("never.folded")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = profiler(&[
+        "--wasm",
+        &wasm,
+        "--fn",
+        "needs_arg",
+        "--args",
+        "abc",
+        "--output",
+        &output,
+    ]);
+    code(&run, 1);
+    let message = stderr(&run);
+    assert!(
+        message.contains("--args") && message.contains("abc"),
+        "the refusal has to name the flag and the value it could not read: {message:?}"
     );
     assert!(
         !Path::new(&output).exists(),
