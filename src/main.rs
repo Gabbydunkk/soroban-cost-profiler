@@ -1882,7 +1882,10 @@ mod tests {
         };
 
         let error = input_failure(run(&cli).unwrap_err());
-        assert!(error.contains("--args") && error.contains("compare"), "{error}");
+        assert!(
+            error.contains("--args") && error.contains("compare"),
+            "{error}"
+        );
     }
 
     /// Stage 4's own output is what `compare` consumes: two runs of the same contract differ by
