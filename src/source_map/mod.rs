@@ -200,9 +200,9 @@ const RESOLUTION_CACHE_LIMIT: usize = 4096;
 /// on ordinary optimized builds, and a warning that fires on a correct binary is a warning the user
 /// learns to skip past.
 ///
-/// Inclusive at the bound: exactly 90% unanswered is not degenerate, because a binary that still
-/// answers one sample in ten is degraded rather than wrong, and the frames it does give are the
-/// ones a flamegraph is built from.
+/// The silent band includes the bound: exactly 90% unanswered is not degenerate, because a binary
+/// that still answers one sample in ten is degraded rather than wrong, and the frames it does give
+/// are the ones a flamegraph is built from.
 const DEGENERATE_RATIO: f64 = 0.90;
 
 impl SourceMapper {
@@ -1209,8 +1209,9 @@ mod tests {
 
     #[test]
     fn a_sample_at_the_threshold_is_not_a_degenerate_binary() {
-        // The bound is inclusive: a binary that still answers one sample in ten is degraded, not
-        // wrong, and interrupting a run over it is how warnings get ignored.
+        // The silent band includes the threshold itself: a binary that still answers one sample
+        // in ten is degraded, not wrong, and interrupting a run over it is how warnings get
+        // ignored.
         assert_eq!(degenerate_message(9, 10), None, "exactly 90% is inside");
         assert_eq!(degenerate_message(90, 100), None);
         assert_eq!(degenerate_message(0, 17), None, "answers every sample");
